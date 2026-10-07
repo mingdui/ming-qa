@@ -1172,6 +1172,60 @@ def render_config_yaml(base_branch: str, commands: dict[str, list[str]]) -> str:
     return "\n".join(lines)
 
 
+def _detect_adb_devices(repo: Path, timeout: int = 15) -> dict[str, Any]:
+    """解析 `adb devices`，区分已授权 / 未授权 / 其他状态。
+
+    未授权（手机上的「允许 USB 调试」没点）不能算作可用设备——这是使用者
+    首次运行时最常卡住的地方，doctor 要能据此给出可操作的下一步。
+    """
+    adb = shutil.which("adb")
+    info: dict[str, Any] = {
+        "available": False, "adbPath": "", "devices": [],
+        "authorized": [], "unauthorized": [],
+    }
+    if not adb:
+        return info
+    info["available"] = True
+    info["adbPath"] = adb
+    result = run_cmd([adb, "devices"], repo, timeout=timeout)
+    for line in (result.get("stdout") or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("List of devices"):
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        serial, state = parts[0], parts[1]
+        info["devices"].append(serial)
+        if state == "device":
+            info["authorized"].append(serial)
+        elif state == "unauthorized":
+            info["unauthorized"].append(serial)
+    return info
+
+
+def _mobile_platform_tasks(repo: Path) -> list[dict[str, Any]]:
+    """读取 current/test-spec-tasks.json，返回 platform == "android-real" 的 task。
+
+    缺省 platform 视为 web（存量数据零迁移）。文件缺失或损坏时返回空列表——
+    检测逻辑不能因为读不到文件就抛异常。
+    """
+    path = repo / ".qa-agent" / "current" / "test-spec-tasks.json"
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+        return []
+    tasks = data.get("tasks") if isinstance(data, dict) else None
+    if not isinstance(tasks, list):
+        return []
+    return [
+        task for task in tasks
+        if isinstance(task, dict) and (task.get("platform") or "web") == "android-real"
+    ]
+
+
 def detect_playwright_assets(repo: Path) -> dict[str, Any]:
     agent_files = []
     agent_names = {
