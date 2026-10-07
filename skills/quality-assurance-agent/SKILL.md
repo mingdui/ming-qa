@@ -114,9 +114,11 @@ json，原始 manifest 只列路径——判断「上一轮走到哪、缺什么
    - 另一条常见路径是让用户把服务起起来。先问清楚：这个服务本次 scope 用得到吗？用得到就起，用不到才豁免。
 4. **工具链门禁**：结合 scope（步骤 1）和 doctor 检查结果（步骤 3），判定本次验收的必需工具链：
    - scope 涉及前端 E2E（浏览器操作 / UI 流程）→ Playwright **运行时**为必须项（`@playwright/test` 声明 + 已安装 + `playwright.config` + 浏览器二进制，对应 doctor 的 `playwright_runtime` / `playwright_browsers` 两项须为 OK）。`playwright_assets` 里的 agents 定义（planner/generator/healer）是可选增强，只在需要生成/修复 spec 时才要求
+   - scope 涉及 Android 客户端（`platform: android-real` 的 task）→ 移动端工具链为必须项（doctor 的 `mobile_adb` / `mobile_devices` / `mobile_mcp` 三项；adb 缺失、设备未授权、mobile-mcp 未注册都算未就绪）
    - scope 涉及数据库资金 / 状态验证 → MySQL MCP 为必须项
-   - scope 为纯 API 验收或纯单元测试 → 两者均为可选项
-   - **必须项缺失**：按 `config` 的 `toolchain.autoInstall` 决策——`true` 则自动执行 `install-playwright-runtime`（装 `@playwright/test` + 浏览器 + 自动生成 `playwright.config`）和 `install-mysql-mcp`（装好继续）；`install-playwright-agents` 只装 agents 定义，需生成/修复 spec 时才执行。`false`（默认）则告知缺什么 + 询问"我可以自动装，要装吗？"
+   - scope 为纯 API 验收或纯单元测试 → 三者均为可选项
+   - **必须项缺失**：按 `config` 的 `toolchain.autoInstall` 决策——`true` 则自动执行 `install-playwright-runtime`（装 `@playwright/test` + 浏览器 + 自动生成 `playwright.config`）、`install-mysql-mcp` 和 `install-mobile-e2e`（装 mobile-mcp + adb，装好继续）；`install-playwright-agents` 只装 agents 定义，需生成/修复 spec 时才执行。`false`（默认）则告知缺什么 + 询问"我可以自动装，要装吗？"
+   - **移动端的安装边界**：`install-mobile-e2e` 装不了手机上的 USB 调试授权——那是物理操作。命令会把这几步作为 `manualSteps` 返回，必须如实转达用户，**不能报「装好了」就继续**。iOS 需要 macOS，本工具包不支持，不要尝试绕过。
    - **自动安装失败分类**：网络 / 下载超时 → 重试（最多 `toolchain.installRetryMax`，默认 2 次）；权限不足 / 配置冲突 / Playwright 已知 bug → 立即交回用户（不盲目重试）
    - 安装动作（装了什么、改了哪些配置）记录到 `environment-checks.json`，便于追溯
    - **可选项缺失 → 放行**：记录到 `environment-checks.json`，继续流程

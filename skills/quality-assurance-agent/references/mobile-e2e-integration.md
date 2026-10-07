@@ -21,7 +21,22 @@
 
 ## 环境准备
 
-三步，缺一不可。
+**优先用命令自动完成**：
+
+```bash
+python "$QA_AGENT_DIR/scripts/qa_agent.py" install-mobile-e2e --repo .
+```
+
+它做三件事（幂等）：注册 mobile-mcp 到 `.mcp.json`、安装 Android Platform Tools、（加
+`--with-mobilewright` 时）安装 `@mobilewright/test`。
+
+adb 的装法：优先用平台包管理器（winget / brew / apt）；**都没有时回退到 Google 官方 CDN
+下载 zip 到 `~/.ming-qa/platform-tools/`**——Windows 10 LTSC 默认没有 winget，走的就是这条
+回退。这条回退**不修改系统 PATH**：要在命令行直接敲 `adb`，需自行把该目录加进 PATH。
+
+装完命令会把仍需人工完成的步骤（USB 授权）作为 `manualSteps` 报出来。**那不是失败，是物理操作**，见下方第 2 步。
+
+下面的手工步骤供排查使用，或在包管理器与下载都不可用时兜底。
 
 ### 1. 安装 Android Platform Tools（含 adb）
 

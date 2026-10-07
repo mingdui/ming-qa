@@ -33,6 +33,12 @@ python "$QA_AGENT_DIR/scripts/qa_agent.py"doctor --repo . --strict --check-serv
 > Next.js workspace root 推断（导致动态路由 404）。`install-playwright-runtime` 自动装到该目录，
 > `run-e2e` 在该目录执行 spec。`playwright.config.js` 的 `testDir` 为 `./e2e`（相对 playwrightDir）。
 
+> **Android 真机 E2E**：scope 涉及 `platform: android-real` 的 task 时，执行
+> `install-mobile-e2e --repo .`（注册 mobile-mcp 到 `.mcp.json` + 安装 Android Platform Tools）。
+> adb 优先用平台包管理器（winget / brew / apt），都没有时回退到 Google 官方 CDN 下载到
+> `~/.ming-qa/platform-tools`（**不修改系统 PATH**）。装完仍需人工完成手机上的 USB 授权——
+> 命令会把这几步作为 `manualSteps` 报出来。完整说明见 `references/mobile-e2e-integration.md`。
+
 ## 阶段 0：上下文
 
 ```powershell

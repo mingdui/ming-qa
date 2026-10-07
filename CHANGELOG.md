@@ -12,6 +12,8 @@
 - Android 真机 E2E 支持：`doctor` 新增条件化检测组（`mobile_adb` / `mobile_devices` / `mobile_mcp`）
   与 `--require-mobile-e2e` 开关；spec-task 新增 `platform` 字段；
   新增 `references/mobile-e2e-integration.md`
+- 新增 `install-mobile-e2e` 命令：注册 mobile-mcp 到 `.mcp.json`，并按平台安装
+  Android Platform Tools（包管理器不可用时回退到 Google 官方 CDN 下载，不修改系统 PATH）
 
 ## [2.0.0] - 2026-09-16
 
