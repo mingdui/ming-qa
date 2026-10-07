@@ -20,6 +20,7 @@ import time
 import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
+import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -1178,7 +1179,7 @@ def _detect_adb_devices(repo: Path, timeout: int = 15) -> dict[str, Any]:
     未授权（手机上的「允许 USB 调试」没点）不能算作可用设备——这是使用者
     首次运行时最常卡住的地方，doctor 要能据此给出可操作的下一步。
     """
-    adb = shutil.which("adb")
+    adb = _find_adb()
     info: dict[str, Any] = {
         "available": False, "adbPath": "", "devices": [],
         "authorized": [], "unauthorized": [],
@@ -1187,7 +1188,8 @@ def _detect_adb_devices(repo: Path, timeout: int = 15) -> dict[str, Any]:
         return info
     info["available"] = True
     info["adbPath"] = adb
-    result = run_cmd([adb, "devices"], repo, timeout=timeout)
+    # adb 会在 cwd 写 adb.log——刻意不在目标 repo 下跑，避免污染工作区
+    result = run_cmd([adb, "devices"], Path(tempfile.gettempdir()), timeout=timeout)
     for line in (result.get("stdout") or "").splitlines():
         line = line.strip()
         if not line or line.startswith("List of devices"):
@@ -1247,6 +1249,236 @@ def should_check_mobile(repo: Path, require_flag: bool = False) -> bool:
     是同一个模式。
     """
     return bool(require_flag) or bool(_mobile_platform_tasks(repo))
+
+
+def _register_mobile_mcp(repo: Path, platform: str | None = None) -> dict[str, Any]:
+    """把 mobile-mcp 写进 .mcp.json 的 mcpServers，保留已有 server。
+
+    幂等：已注册则跳过。文件损坏时重建而非报错——安装流程不该被一个坏文件打断。
+    Windows 上必须用 `cmd /c npx` 启动，否则 MCP 客户端找不到 npx
+    （对照 .mcp.json 里 playwright-test 的写法）。
+    """
+    plat = platform or ("windows" if os.name == "nt" else sys.platform)
+    path = repo / ".mcp.json"
+    data: dict[str, Any] = {}
+    if path.exists():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                data = loaded
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+            data = {}
+    servers = data.get("mcpServers")
+    if not isinstance(servers, dict):
+        servers = {}
+    if "mobile-mcp" in servers:
+        return {"status": "skipped", "path": str(path), "reason": "mobile-mcp 已注册"}
+    if plat == "windows":
+        servers["mobile-mcp"] = {
+            "command": "cmd",
+            "args": ["/c", "npx", "-y", "@mobilenext/mobile-mcp@latest"],
+        }
+    else:
+        servers["mobile-mcp"] = {
+            "command": "npx",
+            "args": ["-y", "@mobilenext/mobile-mcp@latest"],
+        }
+    data["mcpServers"] = servers
+    write_json(path, data)
+    return {"status": "created", "path": str(path)}
+
+
+def _adb_install_command(platform: str | None = None) -> list[str] | None:
+    """按平台返回安装 Android Platform Tools 的命令；无可用包管理器时返回 None。
+
+    platform 参数仅为可测性存在，缺省按当前宿主推断。
+    Linux 用 `sudo -n`（非交互）：需要密码时立即失败，而不是挂住等输入。
+    """
+    plat = platform or ("windows" if os.name == "nt" else sys.platform)
+    if plat == "windows":
+        if shutil.which("winget"):
+            return ["winget", "install", "--id", "Google.PlatformTools", "-e",
+                    "--accept-source-agreements", "--accept-package-agreements"]
+        return None
+    if plat == "darwin":
+        if shutil.which("brew"):
+            return ["brew", "install", "--cask", "android-platform-tools"]
+        return None
+    if shutil.which("apt-get"):
+        return ["sudo", "-n", "apt-get", "install", "-y", "android-tools-adb"]
+    return None
+
+
+PLATFORM_TOOLS_URLS = {
+    "windows": "https://dl.google.com/android/repository/platform-tools-latest-windows.zip",
+    "darwin": "https://dl.google.com/android/repository/platform-tools-latest-darwin.zip",
+    "linux": "https://dl.google.com/android/repository/platform-tools-latest-linux.zip",
+}
+
+
+def platform_tools_dir() -> Path:
+    """ming-qa 自管的 platform-tools 目录（用户级缓存，不写入系统 PATH）。"""
+    return Path.home() / ".ming-qa" / "platform-tools"
+
+
+def _find_adb() -> str | None:
+    """定位 adb：优先系统 PATH，其次 ming-qa 自管的下载目录。
+
+    没装包管理器的环境（如 Windows 10 LTSC 没有 winget）只能走下载回退，
+    而下载目录不在 PATH 里——这里必须显式认它，否则装完 doctor 仍报缺失。
+    """
+    found = shutil.which("adb")
+    if found:
+        return found
+    managed = platform_tools_dir() / ("adb.exe" if os.name == "nt" else "adb")
+    return str(managed) if managed.exists() else None
+
+
+def _download_platform_tools(
+    repo: Path,
+    platform: str | None = None,
+    timeout: int = 600,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """从 Google 官方 CDN 下载 platform-tools 并解压到用户缓存目录。
+
+    仅作为包管理器不可用时的回退。下载源是硬编码的官方地址，不接受任意 URL。
+    解压后落在 ~/.ming-qa/platform-tools/，**不修改系统 PATH**。
+    """
+    plat = platform or ("windows" if os.name == "nt" else sys.platform)
+    url = PLATFORM_TOOLS_URLS.get(plat)
+    if not url:
+        return {"status": "manual",
+                "reason": f"不支持的平台：{plat}，请手动安装 Android Platform Tools"}
+    target_root = platform_tools_dir().parent
+    if dry_run:
+        return {"status": "dry-run", "command": f"download {url} -> {target_root}"}
+    tmp_path: Path | None = None
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            payload = resp.read()
+        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
+            tmp.write(payload)
+            tmp_path = Path(tmp.name)
+        target_root.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(tmp_path) as zf:
+            zf.extractall(target_root)
+    except Exception as exc:  # 网络、解压、权限都可能失败
+        return {"status": "failed", "reason": f"下载或解压失败：{exc}", "url": url}
+    finally:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+    adb_path = platform_tools_dir() / ("adb.exe" if os.name == "nt" else "adb")
+    return {"status": "passed", "path": str(adb_path), "url": url}
+
+
+def _adb_manual_steps(repo: Path) -> list[str]:
+    """工具链装完后仍需人工完成的步骤。
+
+    USB 调试授权是物理操作——必须在手机屏幕上点「允许」，任何工具都替代不了。
+    显式报出来，而不是静默跳过让使用者自己撞墙。
+    """
+    info = _detect_adb_devices(repo)
+    if not info["available"] or info["authorized"]:
+        return []
+    return [
+        "在手机上开启：设置 → 关于手机 → 连点版本号 7 次 → 开发者选项 → USB 调试",
+        "USB 连接电脑后，在手机屏幕上点「允许此调试计算机」（建议勾选一律允许）",
+        "确认 `adb devices` 显示 <serial>  device",
+    ]
+
+
+def install_mobile_e2e_in_repo(
+    repo: Path,
+    *,
+    timeout: int = 600,
+    dry_run: bool = False,
+    with_adb: bool = True,
+    with_mobilewright: bool = False,
+) -> dict[str, Any]:
+    """准备 Android 真机 E2E 的工具链（幂等）。
+
+    做三件事：
+      1. 注册 mobile-mcp 到 .mcp.json（保留已有 server）
+      2. 安装 Android Platform Tools（with_adb）
+      3. 安装 @mobilewright/test（with_mobilewright）
+
+    无法自动化的部分（手机上的 USB 授权）在 manualSteps 里返回。
+    """
+    steps: list[dict[str, Any]] = []
+    if dry_run:
+        steps.append({"step": "mobile-mcp", "status": "dry-run",
+                      "command": f"register mobile-mcp in {repo / '.mcp.json'}"})
+    else:
+        steps.append({"step": "mobile-mcp", **_register_mobile_mcp(repo)})
+
+    adb_info = _detect_adb_devices(repo)
+    if not with_adb:
+        steps.append({"step": "adb", "status": "skipped", "reason": "未请求安装（--no-adb）"})
+    elif adb_info["available"]:
+        steps.append({"step": "adb", "status": "skipped", "reason": "adb 已可用",
+                      "detail": adb_info["adbPath"]})
+    else:
+        cmd = _adb_install_command()
+        if cmd is None:
+            # 包管理器不可用 → 回退到 Google 官方下载
+            # （Windows 10 LTSC 没有 winget 就是这种情形）
+            steps.append({"step": "adb", **_download_platform_tools(repo, dry_run=dry_run)})
+        elif dry_run:
+            steps.append({"step": "adb", "status": "dry-run", "command": " ".join(cmd)})
+        else:
+            result = run_cmd(cmd, repo, timeout=timeout)
+            steps.append({
+                "step": "adb",
+                "status": "passed" if result["exitCode"] == 0 else "failed",
+                "command": " ".join(cmd),
+                "result": result,
+            })
+
+    if with_mobilewright:
+        npm = shutil.which("npm") or "npm"
+        cmd = [npm, "install", "--save-dev", "@mobilewright/test"]
+        if dry_run:
+            steps.append({"step": "mobilewright", "status": "dry-run", "command": " ".join(cmd)})
+        else:
+            result = run_cmd(cmd, repo, timeout=timeout)
+            steps.append({
+                "step": "mobilewright",
+                "status": "passed" if result["exitCode"] == 0 else "failed",
+                "command": " ".join(cmd),
+                "result": result,
+            })
+
+    status = "failed" if any(s.get("status") == "failed" for s in steps) else "passed"
+    return {"status": status, "steps": steps, "manualSteps": _adb_manual_steps(repo)}
+
+
+def install_mobile_e2e(args: argparse.Namespace) -> None:
+    repo = Path(args.repo).resolve()
+    if not repo.exists():
+        raise QaAgentError(f"Repo not found: {repo}")
+    install = install_mobile_e2e_in_repo(
+        repo,
+        timeout=args.timeout,
+        dry_run=bool(getattr(args, "dry_run", False)),
+        with_adb=not bool(getattr(args, "no_adb", False)),
+        with_mobilewright=bool(getattr(args, "with_mobilewright", False)),
+    )
+    print(f"Android 真机 E2E 工具链：{install['status']}")
+    for step in install["steps"]:
+        line = f"  [{step['status']}] {step['step']}"
+        if step.get("reason"):
+            line += f" — {step['reason']}"
+        if step.get("command"):
+            line += f" — {step['command']}"
+        print(line)
+    if install["manualSteps"]:
+        print("")
+        print("仍需人工完成（无法自动化）：")
+        for item in install["manualSteps"]:
+            print(f"  - {item}")
+    if install["status"] != "passed":
+        raise SystemExit(1)
 
 
 def detect_playwright_assets(repo: Path) -> dict[str, Any]:
@@ -11072,6 +11304,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--timeout", type=int, default=12)
     p.add_argument("--json")
     p.set_defaults(func=install_mysql_mcp)
+
+    p = sub.add_parser("install-mobile-e2e", help="准备 Android 真机 E2E 工具链（mobile-mcp + adb）")
+    p.add_argument("--repo", default=".")
+    p.add_argument("--timeout", type=int, default=600)
+    p.add_argument("--no-adb", action="store_true", help="跳过 Android Platform Tools 安装")
+    p.add_argument("--with-mobilewright", action="store_true", help="一并安装 @mobilewright/test")
+    p.add_argument("--dry-run", action="store_true", help="仅打印命令不执行")
+    p.set_defaults(func=install_mobile_e2e)
 
     p = sub.add_parser("config-mysql-mcp", help="根据 QA_AGENT 配置 mysql_mcp（.mcp.json / .codex/config.toml）")
     p.add_argument("--repo", default=".")
