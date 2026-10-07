@@ -126,6 +126,19 @@ python "$QA_AGENT_DIR/scripts/qa_agent.py"assert-script-implementation --spec-t
 
 E2E fixture（`tests/e2e/lib/e2e-fixture.js`）由 `init-project` 首次部署，提供 `loginAsQA()`、`getTestValue()` 等可复用操作。团队后续可一起维护此 fixture。
 
+## 移动端 E2E 输出约定
+
+`platform: android-real` 的 task 走独立目录与独立驱动，不复用 Web 的 `tests/e2e/`：
+
+| 项 | 约定 |
+|---|---|
+| `targetFile` | `tests/e2e-mobile/<module>/<case-id>.spec.ts` |
+| `command` | `npx mobilewright test --project=android` |
+| 驱动 | `@mobilewright/test`（Playwright 风格 API） |
+| 执行细节 | `$QA_AGENT_DIR/references/mobile-e2e-integration.md` |
+
+`platform` 缺省为 `web`；只有 scope 明确涉及 Android 客户端时才生成 `android-real` task。
+
 ## 容错与降级
 
 - **上游产物缺失**：`test-cases.json` 不存在或未确认时，退回 `qa-testcase-designer` 阶段，不生成 task。

@@ -8,6 +8,8 @@
 | 登录态时序 | 登录后页面重定向到 `/` 而非目标页 | 加大 waitForTimeout 或在 reload 后等 AuthContext 初始化完毕 |
 | MCP selector 解析错误 | `Unexpected token while parsing css selector` | 降级到 `browser_run_code_unsafe` 写裸 Playwright 代码（`page.locator()` / `page.getByRole()`） |
 | auth middleware 重定向 | 已设 token 但导航到 `/inventory` 后跳回 `/` | 确认 `localStorage.setItem` 在 `page.goto` 之前完成，token 字段名正确 |
+| 移动端设备未授权 | `adb devices` 显示 `unauthorized` | 在手机屏幕上点「允许 USB 调试」；弹窗不出现时执行 `adb kill-server && adb devices` 重新触发 |
+| 移动端设备歧义 | 多台设备在线，操作对象不确定 | 显式指定 `--device <serial>`，不允许静默选取第一台 |
 
 ## E2E 执行路径选择
 

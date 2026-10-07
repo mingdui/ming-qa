@@ -83,7 +83,7 @@ Both are configured in [docs/configuration.md](docs/configuration.md).
 - Python 3.9+ (stdlib only — no third-party runtime dependencies)
 - Git
 - Target project: Maven or Node.js/npm; other types (Python, Go, Gradle, etc.) are accommodated by the AI during execution
-- E2E tests are Playwright-based and cover the Web; iOS / Android clients are planned for future support
+- E2E tests are Playwright-based and cover the Web, plus Android real devices (via Mobilewright / mobile-mcp); iOS clients are planned for future support
 
 ## Troubleshooting
 

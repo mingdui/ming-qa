@@ -41,7 +41,7 @@ Pass when:
 Pass when:
 
 - Critical user flows are covered by E2E or explicitly justified as not automatable.
-- Browser tests assert real API responses for submit/state-changing actions, not only DOM transitions.
+- E2E tests assert real API responses for submit/state-changing actions, not only DOM transitions.
 - Artifacts such as HTML report, trace, screenshots, or videos are linked when available.
 - Playwright Test Agents installed/listed is environment readiness; it only supports G4 and does not pass G4 by itself.
 
@@ -53,7 +53,7 @@ Track separately from business cases:
 - Local secrets and account env vars: `QA_AGENT_LLM_API_KEY`, configured account username/password env vars, and local-only `.qa-agent/local/.env`.
 - Local services: URLs from `.qa-agent/local/services.local.json`; run `doctor --strict --check-services` before real-local E2E.
 - Encoding readiness on Windows: `doctor` warns about non-UTF-8 consoles; generated JSON/HTML/Markdown artifacts must still pass `check-mojibake --strict`.
-- Test discovery: real test roots exist; globs match files; Playwright can list tests when E2E is planned.
+- Test discovery: real test roots exist; globs match files; the E2E runner can list tests when E2E is planned.
 - Browser/Playwright agent readiness: installed agents and browser dependencies.
 - External dependencies: database, Redis, queue, network service, credentials, or browser server availability.
 

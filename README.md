@@ -85,7 +85,7 @@ agent 会自动初始化项目、体检环境、按验收范围装好需要的�
 - Python 3.9+（仅用标准库，无第三方运行时依赖）
 - Git
 - 目标项目：Maven 或 Node.js/npm，其他类型（Python、Go、Gradle 等）AI 执行过程可自动兼容
-- E2E 测试基于 Playwright，覆盖 Web；iOS / Android 客户端未来规划
+- E2E 测试基于 Playwright 覆盖 Web，并支持 Android 真机（基于 Mobilewright / mobile-mcp）；iOS 客户端未来规划
 
 ## 遇到问题
 

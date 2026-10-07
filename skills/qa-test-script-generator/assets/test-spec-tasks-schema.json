@@ -11,6 +11,7 @@
       "sourceCaseId": "TC-P0-001",
       "priority": "P0|P1|P2|P3",
       "layer": "unit|integration|api|e2e",
+      "platform": "web|android-real",
       "targetFile": "tests/api/module/tc-p0-001.sh",
       "testName": "可读的测试名称",
       "command": "可复制粘贴执行的命令",
@@ -35,3 +36,6 @@
   ]
 }
 ```
+
+`platform` 缺省为 `web`。取值 `android-real` 表示 Android 真机 E2E——执行细节见 `references/mobile-e2e-integration.md`。
+`ios-sim` 预留但需要 macOS，本期未实现。
