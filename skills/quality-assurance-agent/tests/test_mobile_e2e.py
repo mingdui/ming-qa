@@ -106,3 +106,34 @@ def test_malformed_spec_tasks_does_not_raise(qa, tmp_path):
     current.mkdir(parents=True, exist_ok=True)
     (current / "test-spec-tasks.json").write_text("{ not json", encoding="utf-8")
     assert qa._mobile_platform_tasks(tmp_path) == []
+
+
+# --- ③ 条件化阻断判定 ---
+
+
+def test_no_mobile_task_skips_check(qa, tmp_path):
+    """纯 Web 项目不该因为「没插手机」而被拦住。"""
+    _write_spec_tasks(tmp_path, [{"id": "TASK-001", "layer": "e2e", "platform": "web"}])
+    assert qa.should_check_mobile(tmp_path) is False
+
+
+def test_mobile_task_triggers_check(qa, tmp_path):
+    _write_spec_tasks(tmp_path, [{"id": "TASK-002", "layer": "e2e", "platform": "android-real"}])
+    assert qa.should_check_mobile(tmp_path) is True
+
+
+def test_flag_forces_check_even_without_tasks(qa, tmp_path):
+    """--require-mobile-e2e 显式要求时，即使没有 mobile task 也要检测。"""
+    assert qa.should_check_mobile(tmp_path, require_flag=True) is True
+
+
+def test_mobile_mcp_registration_detected(qa, tmp_path):
+    (tmp_path / ".mcp.json").write_text(
+        json.dumps({"mcpServers": {"mobile-mcp": {"command": "npx"}}}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    assert qa._mobile_mcp_registered(tmp_path) is True
+
+
+def test_mobile_mcp_absent_is_false(qa, tmp_path):
+    assert qa._mobile_mcp_registered(tmp_path) is False

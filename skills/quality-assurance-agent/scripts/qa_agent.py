@@ -1226,6 +1226,29 @@ def _mobile_platform_tasks(repo: Path) -> list[dict[str, Any]]:
     ]
 
 
+def _mobile_mcp_registered(repo: Path) -> bool:
+    """`.mcp.json` 里是否已注册 mobile-mcp。"""
+    path = repo / ".mcp.json"
+    if not path.exists():
+        return False
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+        return False
+    servers = data.get("mcpServers") if isinstance(data, dict) else None
+    return isinstance(servers, dict) and "mobile-mcp" in servers
+
+
+def should_check_mobile(repo: Path, require_flag: bool = False) -> bool:
+    """是否进入移动端检测。
+
+    只有项目确有 android-real task 时才检测——否则一个纯后端项目跑 doctor
+    会因为「没插手机」而失败。这与 services 探活「被标记为 required 才阻断」
+    是同一个模式。
+    """
+    return bool(require_flag) or bool(_mobile_platform_tasks(repo))
+
+
 def detect_playwright_assets(repo: Path) -> dict[str, Any]:
     agent_files = []
     agent_names = {
@@ -6984,6 +7007,53 @@ def doctor(args: argparse.Namespace) -> None:
                     next_action="在 config/env.shared 配置 QA_WEB_BASE_URL",
                 )
 
+        # 移动端（Android 真机）：仅在项目确有 android-real task 时进入检测。
+        # 一个纯 Web 项目不该因为「没插手机」而失败——这与 services 探活
+        # 「被标记为 required 才阻断」是同一个模式。
+        require_mobile = bool(getattr(args, "require_mobile_e2e", False))
+        if should_check_mobile(repo, require_mobile):
+            mobile_tasks = _mobile_platform_tasks(repo)
+            adb_info = _detect_adb_devices(repo)
+            add(
+                "mobile_adb",
+                adb_info["available"],
+                adb_info["adbPath"] or "未找到 adb；Android 真机测试需要它",
+                required=require_mobile,
+                next_action="" if adb_info["available"] else
+                "安装 Android Platform Tools（含 adb）并加入 PATH："
+                "https://developer.android.com/tools/releases/platform-tools",
+            )
+            if adb_info["available"]:
+                if adb_info["authorized"]:
+                    ok = True
+                    detail = f"{len(adb_info['authorized'])} 台已授权设备：{', '.join(adb_info['authorized'])}"
+                    action = ""
+                elif adb_info["unauthorized"]:
+                    ok = False
+                    detail = f"{len(adb_info['unauthorized'])} 台设备未授权：{', '.join(adb_info['unauthorized'])}"
+                    action = ("在手机屏幕上点「允许 USB 调试」；若弹窗未出现，拔插 USB 后执行 "
+                              "adb kill-server && adb devices 重新触发授权")
+                else:
+                    ok = False
+                    detail = "adb 可用但未发现设备"
+                    action = "用 USB 连接 Android 设备，并在开发者选项中开启 USB 调试"
+                add(
+                    "mobile_devices",
+                    ok,
+                    detail,
+                    required=bool(mobile_tasks) or require_mobile,
+                    next_action=action,
+                )
+            mcp_registered = _mobile_mcp_registered(repo)
+            add(
+                "mobile_mcp",
+                mcp_registered,
+                "mobile-mcp 已注册" if mcp_registered else "mobile-mcp 未注册",
+                required=require_mobile,
+                next_action="" if mcp_registered else
+                "claude mcp add mobile-mcp -- npx -y @mobilenext/mobile-mcp@latest",
+            )
+
         # MySQL MCP 配置：仅 --config-mysql-mcp 时执行（doctor 默认只检查，不改配置），复用 configure_mysql_mcp 配两边
         if getattr(args, "config_mysql_mcp", False):
             configured = configure_mysql_mcp(repo, "both")
@@ -10940,6 +11010,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--agent", default=AGENT_CLAUDE, type=normalize_agent_name, choices=list(AGENT_CHOICES),
                    help="Agent 类型：claude-code / codex / both。兼容旧名 claude")
     p.add_argument("--check-services", action="store_true", help="探测 .qa-agent/local/.env 中配置的服务 URL 可达性")
+    p.add_argument(
+        "--require-mobile-e2e",
+        action="store_true",
+        dest="require_mobile_e2e",
+        help="将移动端检测项升级为阻断：缺 adb 或 mobile-mcp 未注册时 doctor 失败",
+    )
     p.add_argument("--auto-start", action="store_true", help="若服务不可达则自动启动（使用 init 推导的 startCmd/readySignal/dir，可在 services.local.json 覆盖）")
     p.add_argument("--no-kill", action="store_true", help="--auto-start 时不杀占用端口的旧进程，仅跳过")
     p.add_argument("--start-timeout", type=int, default=120, help="自动启动等待超时秒数（默认 120）")
