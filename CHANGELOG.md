@@ -5,6 +5,14 @@
 格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### Added
+
+- Android 真机 E2E 支持：`doctor` 新增条件化检测组（`mobile_adb` / `mobile_devices` / `mobile_mcp`）
+  与 `--require-mobile-e2e` 开关；spec-task 新增 `platform` 字段；
+  新增 `references/mobile-e2e-integration.md`
+
 ## [2.0.0] - 2026-09-16
 
 首次公开发布。与内部使用的 1.1.x 相比，主要是分发方式与内部耦合的移除。
