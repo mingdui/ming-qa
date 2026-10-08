@@ -107,9 +107,12 @@ mobile_click_on_screen_at_coordinates / mobile_type_keys
 mobile_get_device_logs             # 崩溃 / 异常取证
 ```
 
-**定位必须基于 accessibility tree 返回的元素树，不基于截图找坐标。**
+**优先用 accessibility tree 的元素树定位；元素树不可用时，退回截图 + 坐标。**
 
-元素树是确定性的、token 高效的；截图找坐标既昂贵又脆弱。坐标点击仅作为元素树无法覆盖时的降级手段，且必须在 evidence 中标注降级原因。
+元素树是确定性的、token 高效的；截图找坐标既昂贵又脆弱。但**有一类应用根本没有元素树**——
+游戏引擎（Godot / Unity）等自绘 UI 可能整屏只暴露少数几个容器节点（实测某 Godot 游戏只有
+3 个 FrameLayout）。此时截图 + 坐标是**唯一**可行手段，不属于违规降级，但必须在 evidence
+中标注原因，并说明棋盘/控件区域是如何标定的。
 
 ## 多设备处理
 
@@ -179,6 +182,47 @@ mobilecli daemon stop     # 下次列设备时会自动重启并重扫
 > daemon（源码里写着 `we must have mobilecli working`）。所以
 > **Android SDK / `ANDROID_HOME` 都不是必需项**——别因为「列不出设备」就去装 Android Studio
 > 或申请云真机，本地真机一直都在，问题在这两层。
+
+### 点击 / 滑动 / 按键全部被拒，但截图和元素树正常
+
+Android 报 `SecurityException: Injecting to another application requires INJECT_EVENTS permission`，
+或 mobile-mcp 报 `agent error -32603: device refused MotionEvent`。
+
+**这是 MIUI（小米 / Redmi）的系统级加固，不是工具故障。** 用这组对照 5 秒内定位：
+
+| 能力 | 正常 | 被拦 | 走的路径 |
+|---|---|---|---|
+| 截图 / 读元素树 | ✅ | ✅ | 只读——说明 ADB 通路本身是好的 |
+| 点击 / 滑动 | ✅ | ❌ | MotionEvent 注入 |
+| `mobile_press_button` | ✅ | ❌ | keyevent 注入（另一条路径） |
+
+**处置**：手机端 **设置 → 更多设置 → 开发者选项 → 「USB调试(安全设置)」** 打开。
+
+> 该开关部分 MIUI 版本要求「登录小米账号」，个别版本还要求插 SIM 卡。
+> **先让使用者实际点一下看弹窗，不要凭「没有 SIM 卡」预先判定不可行**——实测某个 MIUI 12
+> 只校验账号，无 SIM 卡也能开启。
+>
+> 确实开不了时的退路：① 临时插一张废 SIM（MIUI 只做存在性校验）；② 换非 MIUI 设备；
+> ③ 改用基于 AccessibilityService 的工具（不走 `input` 注入，因而不受此限）。
+
+**此限制 agent 无法绕过**——检测到就必须如实告知使用者，不能假装操作成功。
+
+### 两个截图 API 的坐标系不同
+
+| API | 输出 | 用途 |
+|---|---|---|
+| `mobile_take_screenshot` | **缩略图**（如 360×800），附 ×N 换算说明 | 人眼查看 |
+| `mobile_save_screenshot` | **原始分辨率**（如 1080×2400） | 像素与坐标分析 |
+
+做任何坐标计算必须用 `mobile_save_screenshot`。两套坐标混用会算出错误的点击位置，
+而且错得很隐蔽——点得到屏幕上某处，只是不是你想要的那处。
+
+### 截图前必须等动画结束
+
+在转场 / 连锁动画播放途中截图，读到的是被特效覆盖的脏数据（实测：棋盘区域被过渡特效染成
+单一色调，求解器据此输出了 112 个「合法走法」这种明显失真的结果）。
+
+**识别信号**：结果数量突然暴增、或元素分布异常单一 = 截图时机不对，**重截，不要采信这份结果**。
 
 ### 所有 `mobile_*` 调用都必须显式传 `device`
 
