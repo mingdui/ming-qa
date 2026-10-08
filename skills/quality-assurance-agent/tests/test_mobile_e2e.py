@@ -355,6 +355,29 @@ def test_no_path_note_when_adb_on_path(qa, tmp_path, monkeypatch):
     assert not any("PATH" in n for n in result["notes"])
 
 
+def test_notes_warn_about_stale_daemon_after_path_change(qa, tmp_path, monkeypatch):
+    """配完 PATH 要提醒 daemon 缓存。
+
+    mobilecli 的 daemon 在 adb 不可见时启动，就会一直记着「零设备」且不报错——
+    光修 PATH 不重启 daemon 依然列不出设备。这个坑真实发生过。
+
+    断言用 "daemon stop" 而非 "daemon"：tmp_path 的目录名取自测试函数名，
+    用泛词会被自己的路径污染，测试就永远通过了（假阳性）。
+    """
+    _fake_managed_adb(monkeypatch, qa, tmp_path)
+    monkeypatch.setattr(qa, "_add_to_user_path",
+                        lambda *a, **kw: {"status": "passed", "path": "x"})
+    result = qa.install_mobile_e2e_in_repo(tmp_path, with_adb=False, add_to_path=True)
+    assert any("daemon stop" in n for n in result["notes"]), "没有提醒 daemon 缓存"
+
+
+def test_no_daemon_note_without_add_to_path(qa, tmp_path, monkeypatch):
+    """没改 PATH 就不必提 daemon——避免噪音。"""
+    _fake_managed_adb(monkeypatch, qa, tmp_path)
+    result = qa.install_mobile_e2e_in_repo(tmp_path, with_adb=False)
+    assert not any("daemon stop" in n for n in result["notes"])
+
+
 def test_adb_step_reports_path(qa, tmp_path, monkeypatch):
     """检测到 adb 时步骤要带上落盘路径——只报一句状态而不说它在哪，使用者找不到它。"""
     _fake_managed_adb(monkeypatch, qa, tmp_path)

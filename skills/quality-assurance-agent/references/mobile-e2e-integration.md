@@ -147,3 +147,40 @@ mobile_get_device_logs             # 崩溃 / 异常取证
 |---|---|---|
 | **设备问题** | 设备离线、USB 授权失效、ADB 断连 | 归入环境问题，修环境后重跑，**不计入产品缺陷** |
 | **设备歧义** | 多台设备在线且未显式指定 | 要求显式指定设备，不允许静默选取 |
+
+## 故障排查
+
+### 设备列表为空，但 `adb devices` 明明看得到设备
+
+**最常见的坑，且症状极具误导性**：工具返回 `{"devices": []}` 却**不报任何错误**。
+
+按顺序排查：
+
+**1. `adb` 不在 PATH**
+
+mobile-mcp / mobilecli 内部调用 `adb` 时**只认 PATH**，不会去 ming-qa 自管目录找。
+用 `install-mobile-e2e --add-to-path` 修，然后**重开会话**（环境变量对已运行的进程不生效）。
+
+**2. mobilecli 的 daemon 缓存了旧状态**
+
+daemon 在 adb 尚不可见时启动，就会一直记着「零设备」，**光修 PATH 不会让它重新扫描**：
+
+```bash
+mobilecli daemon stop     # 下次列设备时会自动重启并重扫
+```
+
+验证：`mobilecli daemon status` 看 `uptime` 是否归零。
+
+**3. 手机上没点「允许 USB 调试」**
+
+`adb devices` 会显示 `unauthorized` 而不是 `device`。
+
+> **为什么这个坑难排查**：mobile-mcp 1.0.8 起，设备发现已经不走 adb，而是走 mobilecli 的
+> daemon（源码里写着 `we must have mobilecli working`）。所以
+> **Android SDK / `ANDROID_HOME` 都不是必需项**——别因为「列不出设备」就去装 Android Studio
+> 或申请云真机，本地真机一直都在，问题在这两层。
+
+### 所有 `mobile_*` 调用都必须显式传 `device`
+
+MCP 没有「当前设备」的隐式概念。每次调用都要带 `device: "<serial>"`，
+多设备在线时尤其如此——不允许静默选取第一台。

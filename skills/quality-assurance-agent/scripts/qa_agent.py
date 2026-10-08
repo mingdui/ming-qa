@@ -1508,6 +1508,12 @@ def install_mobile_e2e_in_repo(
             "需要该目录在 PATH 里——用 --add-to-path 添加，或手动加入。"
             "注意：环境变量对已运行的进程不生效，改完必须重开会话。"
         )
+    if add_to_path and not dry_run:
+        notes.append(
+            "如果之前运行过 mobile-mcp：mobilecli 的 daemon 可能在 adb 尚不可见时就已启动，"
+            "并一直缓存着「零设备」——它不报错，只是静默返回空列表，光修 PATH 不会让它重扫。"
+            "执行 `mobilecli daemon stop` 后再列一次设备即可。"
+        )
 
     status = "failed" if any(s.get("status") == "failed" for s in steps) else "passed"
     return {"status": status, "steps": steps,
