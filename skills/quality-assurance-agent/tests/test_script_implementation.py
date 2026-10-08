@@ -60,3 +60,49 @@ def test_test_method_count_sufficient_passes(qa, tmp_path):
         spec["tasks"].append({"id": f"S-{i}", "sourceCaseId": f"C-{i}", "targetFile": "src/test/java/qa/OpenBoxTest.java", "layer": "unit"})
     result = qa.assert_script_implementation_data(spec, tmp_path)
     assert result["status"] == "passed"
+
+
+# --- agent 直驱形态（无独立脚本）---
+#
+# web 侧的 Playwright MCP 直驱与移动端的 mobile-mcp 直驱都属于这类：没有脚本文件可校验。
+# 若不豁免，这个门禁对它们永远无法通过——而 completion gate 的 evidence 要求
+# 才是它们的正确约束点。
+
+
+def test_agent_driven_mobile_target_file_is_skipped(qa, tmp_path):
+    """targetFile 以 @ 开头 = agent 直驱，不判「文件不存在」。"""
+    spec = {"tasks": [
+        {"id": "T1", "sourceCaseId": "C1", "targetFile": "@agent:mobile-mcp", "layer": "e2e"},
+    ]}
+    result = qa.assert_script_implementation_data(spec, tmp_path)
+    assert result["status"] == "passed", result["findings"]
+
+
+def test_agent_driven_playwright_target_file_is_skipped(qa, tmp_path):
+    spec = {"tasks": [
+        {"id": "T1", "sourceCaseId": "C1", "targetFile": "@agent:playwright-mcp", "layer": "e2e"},
+    ]}
+    assert qa.assert_script_implementation_data(spec, tmp_path)["status"] == "passed"
+
+
+def test_real_missing_file_still_fails(qa, tmp_path):
+    """豁免只针对 @ 前缀——真实路径缺失仍要报错，不能把门禁放水。"""
+    spec = {"tasks": [
+        {"id": "T1", "sourceCaseId": "C1",
+         "targetFile": "tests/e2e-mobile/app/tc-p0-001.spec.ts", "layer": "e2e"},
+    ]}
+    result = qa.assert_script_implementation_data(spec, tmp_path)
+    assert result["status"] == "failed"
+    assert result["findings"][0]["type"] == "target-file-missing"
+
+
+def test_agent_driven_tasks_are_excluded_from_file_count(qa, tmp_path):
+    """同一份 spec-tasks 里两种形态并存：只统计真实文件，直驱 task 不计入。"""
+    _write(tmp_path / "tests" / "api" / "tc.sh", "#!/bin/bash\ncurl -s \"$URL\"\nexit 0\n")
+    spec = {"tasks": [
+        {"id": "T1", "sourceCaseId": "C1", "targetFile": "@agent:mobile-mcp", "layer": "e2e"},
+        {"id": "T2", "sourceCaseId": "C2", "targetFile": "tests/api/tc.sh", "layer": "api"},
+    ]}
+    result = qa.assert_script_implementation_data(spec, tmp_path)
+    assert result["status"] == "passed", result["findings"]
+    assert result["summary"]["files"] == 1, "agent 直驱的 task 不该计入文件数"

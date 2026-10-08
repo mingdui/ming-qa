@@ -172,4 +172,4 @@ python "$QA_AGENT_DIR/scripts/qa_agent.py"save-knowledge --repo . --module <mod
 - **E2E 用例必须走真实 UI 操作**。禁止用 `browser_evaluate` 直接调用 API 代替点击/输入/导航。弹窗遮挡就关弹窗，元素不可点击就 scroll/wait，应用层有缓存就调接口刷新——修环境，不降级测试方式。
 - **移动端 task 必须基于 accessibility tree 定位**，禁止退化为截图找坐标。坐标点击仅作元素树无法覆盖时的降级手段，且必须在 evidence 中标注降级原因。
 - **不临时变更 spec-task 的 layer 或断言**。如果 API 层 task 跑不过，不能降级为"手动验证通过"。如果 E2E 层 task 跑不过，不能绕过浏览器改用 curl。计划是什么 layer，就用什么 layer 执行。如果环境确实不支持（如 E2E 依赖 Playwright 但不可用），标记 blocked 并记录原因，不偷偷换方案。**首次执行和回归执行同等约束。**
-- **E2E task 无独立脚本时的处理**：若 `targetFile` 为 "Playwright MCP 真实浏览器操作（无独立脚本文件）" 且 Playwright MCP 不可用，标记 task 为 `blocked`，在 `blocker` 中写 "E2E 脚本缺失 + Playwright MCP 不可用"，在 `nextAction` 中写 "需生成独立 E2E 脚本到 tests/e2e/<module>/，使用 playwright 包直连浏览器（不依赖 @playwright/test runner）"。不要现场手写 E2E 脚本凑数——这属于脚本生成阶段的职责。
+- **E2E task 无独立脚本时的处理**：若 `targetFile` 以 `@` 开头（如 `@agent:playwright-mcp`、`@agent:mobile-mcp`），表示该 task 由 agent 直接驱动、**没有脚本文件**。此时若对应 runner 不可用，标记 task 为 `blocked`，在 `blocker` 里写清是哪个 runner 不可用，在 `nextAction` 里写「需生成独立脚本到 `tests/e2e.../`」。**不要现场手写脚本凑数**——那是脚本生成阶段的职责。

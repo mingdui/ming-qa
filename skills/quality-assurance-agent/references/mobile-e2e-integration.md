@@ -107,6 +107,10 @@ mobile_click_on_screen_at_coordinates / mobile_type_keys
 mobile_get_device_logs             # 崩溃 / 异常取证
 ```
 
+**方式 ② 没有脚本文件**：对应 spec-task 的 `targetFile` 写 `@agent:mobile-mcp`——`@` 开头是约定
+标识，表示「这不是文件路径」。**不要写成 `.spec.ts` 路径**，那会让产物自相矛盾（看路径以为有脚本，
+实际拉不到文件），门禁也会正确地报 `target-file-missing`。想沉淀可回归资产请走方式 ③。
+
 **优先用 accessibility tree 的元素树定位；元素树不可用时，退回截图 + 坐标。**
 
 元素树是确定性的、token 高效的；截图找坐标既昂贵又脆弱。但**有一类应用根本没有元素树**——

@@ -4386,6 +4386,12 @@ def discover_test_method_names(path: Path) -> set[str] | None:
     return names
 
 
+# targetFile 以 @ 开头 = 约定标识「这不是文件路径」：该 task 由 agent 直接驱动，没有独立脚本。
+# web 侧的 Playwright MCP 直驱、移动端的 mobile-mcp 直驱都属于这种形态。
+# 详见 references/mobile-e2e-integration.md 与 qa-test-runner/SKILL.md。
+AGENT_DRIVEN_PREFIX = "@"
+
+
 def assert_script_implementation_data(spec_tasks_data: dict[str, Any], repo: Path) -> dict[str, Any]:
     """脚本实现真实性门禁：映射到文件 ≠ 实现了测试。
 
@@ -4397,12 +4403,19 @@ def assert_script_implementation_data(spec_tasks_data: dict[str, Any], repo: Pat
         return {"version": "1.0", "status": "failed", "summary": {"files": 0, "findings": 1},
                 "findings": [{"type": "invalid-tasks", "severity": "fail", "message": "tasks 必须是数组"}]}
     by_file: dict[str, list[dict[str, Any]]] = {}
+    agent_driven_count = 0
     for t in tasks:
         if not isinstance(t, dict):
             continue
         tf = str(t.get("targetFile", "") or "").strip()
-        if tf:
-            by_file.setdefault(tf, []).append(t)
+        if not tf:
+            continue
+        if tf.startswith(AGENT_DRIVEN_PREFIX):
+            # agent 直驱：没有脚本文件可校验。它的执行证据由 completion gate 的
+            # evidence 要求兜底——在这里硬判「文件不存在」会让这种形态永远无法通过。
+            agent_driven_count += 1
+            continue
+        by_file.setdefault(tf, []).append(t)
     findings: list[dict[str, Any]] = []
     for tf, file_tasks in sorted(by_file.items()):
         path = Path(tf).resolve() if Path(tf).is_absolute() else (Path(repo) / tf).resolve()
@@ -4443,7 +4456,8 @@ def assert_script_implementation_data(spec_tasks_data: dict[str, Any], repo: Pat
         "version": "1.0",
         "generatedAt": utc_now(),
         "status": "failed" if findings else "passed",
-        "summary": {"files": len(by_file), "findings": len(findings)},
+        "summary": {"files": len(by_file), "findings": len(findings),
+                    "agentDrivenTasks": agent_driven_count},
         "findings": findings,
     }
 

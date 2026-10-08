@@ -128,14 +128,24 @@ E2E fixture（`tests/e2e/lib/e2e-fixture.js`）由 `init-project` 首次部署�
 
 ## 移动端 E2E 输出约定
 
-`platform: android-real` 的 task 走独立目录与独立驱动，不复用 Web 的 `tests/e2e/`：
+`platform: android-real` 的 task 走独立目录与独立驱动，不复用 Web 的 `tests/e2e/`。
 
-| 项 | 约定 |
-|---|---|
-| `targetFile` | `tests/e2e-mobile/<module>/<case-id>.spec.ts` |
-| `command` | `npx mobilewright test --project=android` |
-| 驱动 | `@mobilewright/test`（Playwright 风格 API） |
-| 执行细节 | `$QA_AGENT_DIR/references/mobile-e2e-integration.md` |
+移动端有**两种执行形态**，`targetFile` 必须如实反映是哪一种：
+
+| 形态 | `targetFile` | `command` | 说明 |
+|---|---|---|---|
+| **③ 脚本资产** | `tests/e2e-mobile/<module>/<case-id>.spec.ts` | `npx mobilewright test --project=android` | 真写出 spec 文件，可回归、可接 CI |
+| **② agent 直驱** | `@agent:mobile-mcp` | —（agent 通过 MCP 逐屏驱动） | **没有脚本文件** |
+
+> ⚠️ **不要把 ② 的 `targetFile` 写成 `.spec.ts` 路径。** 那样产物会自相矛盾——看路径以为有脚本，
+> 实际去跑拉不到任何文件；而 `assert-script-implementation` 门禁会**正确地**报 `target-file-missing`，
+> 让人误以为是执行失败，其实是标错了形态。
+>
+> `@` 开头的 `targetFile` 是**约定标识**，表示「这不是文件路径」。门禁识别它并跳过文件校验；
+> 该 task 的执行证据由 completion gate 的 `evidence` 要求兜底。
+>
+> **怎么选**：scope 只要求「跑通一次」用 ②；要求「可回归」用 ③。③ 需要额外调通
+> `@mobilewright/test`（`install-mobile-e2e --with-mobilewright`）。
 
 `platform` 缺省为 `web`；只有 scope 明确涉及 Android 客户端时才生成 `android-real` task。
 
