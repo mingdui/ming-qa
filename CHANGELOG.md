@@ -13,7 +13,9 @@
   与 `--require-mobile-e2e` 开关；spec-task 新增 `platform` 字段；
   新增 `references/mobile-e2e-integration.md`
 - 新增 `install-mobile-e2e` 命令：注册 mobile-mcp 到 `.mcp.json`，并按平台安装
-  Android Platform Tools（包管理器不可用时回退到 Google 官方 CDN 下载，不修改系统 PATH）
+  Android Platform Tools（包管理器不可用时回退到 Google 官方 CDN 下载）
+- `install-mobile-e2e` 安装输出会打印 adb 落盘路径，并在 adb 不在 PATH 时明确提示——
+  mobile-mcp 等第三方工具只认 PATH；新增 `--add-to-path` 写入用户 PATH（Windows，幂等）
 
 ## [2.0.0] - 2026-09-16
 

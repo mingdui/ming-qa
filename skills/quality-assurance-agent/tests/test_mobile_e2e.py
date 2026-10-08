@@ -296,3 +296,68 @@ def test_platform_tools_urls_are_https_google(qa):
     """下载源必须是 Google 官方 HTTPS 地址，不接受任意 URL。"""
     for plat, url in qa.PLATFORM_TOOLS_URLS.items():
         assert url.startswith("https://dl.google.com/android/repository/"), f"{plat} 的下载源不是官方地址"
+
+
+# --- ⑨ 用户 PATH 处理 ---
+
+
+def test_path_with_dir_added_appends(qa):
+    assert qa._path_with_dir_added("C:\\a;C:\\b", "C:\\c") == "C:\\a;C:\\b;C:\\c"
+
+
+def test_path_with_dir_added_is_idempotent(qa):
+    """已在 PATH 里的目录不重复追加。"""
+    current = "C:\\a;C:\\b"
+    assert qa._path_with_dir_added(current, "C:\\b") == current
+
+
+def test_path_with_dir_added_handles_empty(qa):
+    assert qa._path_with_dir_added("", "C:\\a") == "C:\\a"
+
+
+def test_path_with_dir_added_drops_empty_segments(qa):
+    """PATH 里常见的空条目（尾部分号造成）不该被放大。"""
+    assert qa._path_with_dir_added("C:\\a;;C:\\b;", "C:\\c") == "C:\\a;C:\\b;C:\\c"
+
+
+def test_add_to_user_path_manual_on_non_windows(qa, tmp_path):
+    """非 Windows 平台不去改 shell 启动文件——动别人的 dotfile 侵入性太大。"""
+    assert qa._add_to_user_path(tmp_path, platform="linux")["status"] == "manual"
+
+
+# --- ⑩ 输出必须提示 PATH（使用者实际踩过的坑）---
+
+
+def _fake_managed_adb(monkeypatch, qa, tmp_path):
+    """adb 只存在于 ming-qa 自管目录，不在系统 PATH。"""
+    monkeypatch.setattr(qa.shutil, "which", lambda n: None)
+    monkeypatch.setattr(qa, "platform_tools_dir", lambda: tmp_path / "platform-tools")
+    (tmp_path / "platform-tools").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "platform-tools" / ("adb.exe" if qa.os.name == "nt" else "adb")).write_text("")
+    monkeypatch.setattr(
+        qa, "run_cmd",
+        lambda *a, **kw: {"exitCode": 0, "stdout": "List of devices attached\n", "stderr": ""},
+    )
+
+
+def test_notes_warn_when_adb_not_on_path(qa, tmp_path, monkeypatch):
+    """adb 在用户目录但不在 PATH 时必须提示——第三方工具（mobile-mcp）只认 PATH。"""
+    _fake_managed_adb(monkeypatch, qa, tmp_path)
+    result = qa.install_mobile_e2e_in_repo(tmp_path, with_adb=False)
+    assert any("PATH" in n for n in result["notes"]), "没有提示 PATH，使用者会像之前那样卡住"
+
+
+def test_no_path_note_when_adb_on_path(qa, tmp_path, monkeypatch):
+    """adb 已在 PATH 时不该刷无意义的提示。"""
+    monkeypatch.setattr(qa.shutil, "which", lambda n: "/usr/bin/adb" if n == "adb" else None)
+    monkeypatch.setattr(qa, "run_cmd", lambda *a, **kw: {"exitCode": 0, "stdout": "", "stderr": ""})
+    result = qa.install_mobile_e2e_in_repo(tmp_path, with_adb=False)
+    assert not any("PATH" in n for n in result["notes"])
+
+
+def test_adb_step_reports_path(qa, tmp_path, monkeypatch):
+    """检测到 adb 时步骤要带上落盘路径——只报一句状态而不说它在哪，使用者找不到它。"""
+    _fake_managed_adb(monkeypatch, qa, tmp_path)
+    result = qa.install_mobile_e2e_in_repo(tmp_path, with_adb=True)
+    adb_step = next(s for s in result["steps"] if s["step"] == "adb")
+    assert adb_step.get("detail") or adb_step.get("path")

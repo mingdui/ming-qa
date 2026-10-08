@@ -31,8 +31,16 @@ python "$QA_AGENT_DIR/scripts/qa_agent.py" install-mobile-e2e --repo .
 `--with-mobilewright` 时）安装 `@mobilewright/test`。
 
 adb 的装法：优先用平台包管理器（winget / brew / apt）；**都没有时回退到 Google 官方 CDN
-下载 zip 到 `~/.ming-qa/platform-tools/`**——Windows 10 LTSC 默认没有 winget，走的就是这条
-回退。这条回退**不修改系统 PATH**：要在命令行直接敲 `adb`，需自行把该目录加进 PATH。
+下载 zip 到 `~/.ming-qa/platform-tools/`**——Windows 10 LTSC 默认没有 winget，走的就是这条回退。
+
+> ⚠️ **下载回退后，该目录必须加入 PATH。**
+>
+> 原因：mobile-mcp 这类第三方工具内部直接调用 `adb`，**只认 PATH**，不知道 ming-qa 自管目录
+> 的存在。而 ming-qa 自己的 `doctor` 会回退到该目录查找（`_find_adb`）——所以会出现
+> 「**本地检测全绿，agent 里却列不出设备**」这种分裂现象，排查时极容易误判为「没有设备」。
+>
+> 用 `install-mobile-e2e --add-to-path` 写入用户 PATH（Windows 写注册表，幂等），或手动添加。
+> **改完必须重开会话**——环境变量对已运行的进程不生效。
 
 装完命令会把仍需人工完成的步骤（USB 授权）作为 `manualSteps` 报出来。**那不是失败，是物理操作**，见下方第 2 步。
 

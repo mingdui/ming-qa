@@ -1372,6 +1372,49 @@ def _download_platform_tools(
     return {"status": "passed", "path": str(adb_path), "url": url}
 
 
+def _path_with_dir_added(current: str, directory: str) -> str:
+    """把 directory 追加到 PATH 字符串末尾（幂等，顺带清掉空条目）。
+
+    PATH 里因尾部分号产生的空条目会拖慢 Windows 的查找，顺手清掉。
+    """
+    parts = [p for p in (current or "").split(";") if p]
+    if directory in parts:
+        return current
+    parts.append(directory)
+    return ";".join(parts)
+
+
+def _add_to_user_path(
+    directory: Path, platform: str | None = None, dry_run: bool = False
+) -> dict[str, Any]:
+    """把目录写进用户级 PATH（幂等，只动用户级，不碰系统级）。
+
+    只实现 Windows（写 HKCU\\Environment）。macOS / Linux 返回 manual——
+    改 shell 启动文件的侵入性更大，而且该改 bashrc / zshrc / profile 取决于
+    用户的 shell，猜错的代价比让使用者自己加一行更高。
+    """
+    plat = platform or ("windows" if os.name == "nt" else sys.platform)
+    target = str(directory)
+    if plat != "windows":
+        return {"status": "manual",
+                "reason": f"非 Windows 平台，请自行把 {target} 加入 PATH"}
+    if dry_run:
+        return {"status": "dry-run", "command": f"append {target} to user PATH"}
+    import winreg  # Windows-only，延迟导入避免其他平台报错
+
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment", 0, winreg.KEY_READ) as key:
+        try:
+            current, kind = winreg.QueryValueEx(key, "Path")
+        except FileNotFoundError:
+            current, kind = "", winreg.REG_EXPAND_SZ
+    if target in [p for p in (current or "").split(";") if p]:
+        return {"status": "skipped", "reason": "已在用户 PATH 中", "path": target}
+    new_value = _path_with_dir_added(current or "", target)
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment", 0, winreg.KEY_SET_VALUE) as key:
+        winreg.SetValueEx(key, "Path", 0, kind, new_value)
+    return {"status": "passed", "path": target, "reason": "已写入用户 PATH，需重开终端才生效"}
+
+
 def _adb_manual_steps(repo: Path) -> list[str]:
     """工具链装完后仍需人工完成的步骤。
 
@@ -1395,6 +1438,7 @@ def install_mobile_e2e_in_repo(
     dry_run: bool = False,
     with_adb: bool = True,
     with_mobilewright: bool = False,
+    add_to_path: bool = False,
 ) -> dict[str, Any]:
     """准备 Android 真机 E2E 的工具链（幂等）。
 
@@ -1449,8 +1493,25 @@ def install_mobile_e2e_in_repo(
                 "result": result,
             })
 
+    found_adb = _find_adb()
+    managed_adb = platform_tools_dir() / ("adb.exe" if os.name == "nt" else "adb")
+    if add_to_path and found_adb and Path(found_adb) == managed_adb:
+        steps.append({"step": "user-path",
+                      **_add_to_user_path(platform_tools_dir(), dry_run=dry_run)})
+
+    # adb 装在 ming-qa 自管目录时，CLI 自己能找到，但第三方工具（mobile-mcp）只认 PATH。
+    # 不提示的话使用者会看到「检测全绿」却在 agent 里用不了——这个坑真实发生过。
+    notes: list[str] = []
+    if found_adb and not shutil.which("adb"):
+        notes.append(
+            f"adb 位于 {found_adb}，但不在系统 PATH 中。mobile-mcp 等第三方工具直接调用 adb，"
+            "需要该目录在 PATH 里——用 --add-to-path 添加，或手动加入。"
+            "注意：环境变量对已运行的进程不生效，改完必须重开会话。"
+        )
+
     status = "failed" if any(s.get("status") == "failed" for s in steps) else "passed"
-    return {"status": status, "steps": steps, "manualSteps": _adb_manual_steps(repo)}
+    return {"status": status, "steps": steps,
+            "manualSteps": _adb_manual_steps(repo), "notes": notes}
 
 
 def install_mobile_e2e(args: argparse.Namespace) -> None:
@@ -1463,6 +1524,7 @@ def install_mobile_e2e(args: argparse.Namespace) -> None:
         dry_run=bool(getattr(args, "dry_run", False)),
         with_adb=not bool(getattr(args, "no_adb", False)),
         with_mobilewright=bool(getattr(args, "with_mobilewright", False)),
+        add_to_path=bool(getattr(args, "add_to_path", False)),
     )
     print(f"Android 真机 E2E 工具链：{install['status']}")
     for step in install["steps"]:
@@ -1471,7 +1533,13 @@ def install_mobile_e2e(args: argparse.Namespace) -> None:
             line += f" — {step['reason']}"
         if step.get("command"):
             line += f" — {step['command']}"
+        if step.get("path"):
+            line += f" — {step['path']}"
+        if step.get("detail"):
+            line += f" — {step['detail']}"
         print(line)
+    for note in install.get("notes", []):
+        print(f"  ! {note}")
     if install["manualSteps"]:
         print("")
         print("仍需人工完成（无法自动化）：")
@@ -11310,6 +11378,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--timeout", type=int, default=600)
     p.add_argument("--no-adb", action="store_true", help="跳过 Android Platform Tools 安装")
     p.add_argument("--with-mobilewright", action="store_true", help="一并安装 @mobilewright/test")
+    p.add_argument("--add-to-path", action="store_true",
+                   help="把 platform-tools 加入用户 PATH（Windows 写注册表；幂等）")
     p.add_argument("--dry-run", action="store_true", help="仅打印命令不执行")
     p.set_defaults(func=install_mobile_e2e)
 
