@@ -10143,6 +10143,8 @@ def render_report(args: argparse.Namespace) -> None:
     _seen_scripts: set[str] = set()
     for _t in (spec_tasks_data.get("tasks") or []):
         _tf = str(_t.get("targetFile") or "").strip()
+        if _tf.startswith(AGENT_DRIVEN_PREFIX):
+            continue  # agent 直驱没有脚本文件，不该出现在「测试脚本」列表里
         if _tf and _tf not in _seen_scripts:
             _seen_scripts.add(_tf)
             test_scripts.append(_tf)

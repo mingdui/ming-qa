@@ -253,6 +253,38 @@ def test_render_report_accepts_contract_shaped_artifacts(project):
     assert "第 3 行未见去重键" in html, "finding 证据未渲染——证据字段口径不一致"
 
 
+def test_agent_driven_target_file_not_listed_as_script(project):
+    """`@` 前缀的 targetFile 是「agent 直驱」标识，不是脚本路径。
+
+    报告里有一栏「测试脚本」是从 spec-task 的 targetFile 提取的。若不排除这个约定值，
+    报告会把它当成脚本列出来——读者会以为存在一个叫 `@agent:mobile-mcp` 的测试文件。
+    """
+    repo, current = project
+    risks = _derive_risks(repo, current)
+    cases_path = _write_cases(repo, risks)
+
+    proc = _run(repo, "generate-spec-tasks", "--cases", str(cases_path), "--repo", ".",
+                "--output", str(current / "test-spec-tasks.json"))
+    assert proc.returncode == 0, _out(proc)
+
+    spec_path = current / "test-spec-tasks.json"
+    spec = json.loads(spec_path.read_text(encoding="utf-8"))
+    assert spec.get("tasks"), "前置条件：spec-tasks 应至少有一条 task"
+    spec["tasks"][0]["targetFile"] = "@agent:mobile-mcp"
+    spec_path.write_text(json.dumps(spec, ensure_ascii=False), encoding="utf-8")
+
+    report = current.parent / "reports" / "agent-driven.html"
+    report.parent.mkdir(parents=True, exist_ok=True)
+    proc = _run(repo, "render-report",
+                "--cases", str(cases_path),
+                "--spec-tasks", str(spec_path),
+                "--output", str(report))
+    assert proc.returncode == 0, _out(proc)
+
+    html = report.read_text(encoding="utf-8", errors="replace")
+    assert "@agent:mobile-mcp" not in html, "agent 直驱标识被当成测试脚本列进了报告"
+
+
 def _advance_to_report(repo: Path, current: Path) -> Path:
     """把链路推到 render-report：执行证据 → 门禁 → 代码审查 → 渲染报告。
 
