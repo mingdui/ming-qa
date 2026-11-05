@@ -2,7 +2,15 @@
 
 当 scope 涉及 iOS / Android 客户端时，使用本参考了解移动端 E2E 的宿主前提、执行路径与证据要求。
 
-移动端 spec-task 的标识是 `platform: android-real`（缺省 `platform` 为 `web`）。
+移动端 spec-task 用 `platform` 标识（缺省为 `web`）：
+
+| `platform` | 含义 | 当前状态 |
+|---|---|---|
+| `web` | 浏览器 E2E（Playwright） | 支持 |
+| `android-real` | Android 真机 | **已实现** |
+| `android-emulator` | Android 模拟器 | **已实现**（与真机共用 adb 通路） |
+| `ios-sim` | iOS 模拟器 | 已接入检测；需 macOS + Xcode，**未实测** |
+| `ios-real` | iOS 真机 | 已接入检测；需 macOS + Xcode，**未实测** |
 
 ## 平台限制
 
@@ -15,9 +23,25 @@
 | iOS 模拟器 | macOS + Xcode + `xcrun simctl` | ❌ | ❌ | ✅ |
 | iOS 真机 | macOS + Xcode + WebDriverAgent + 设备隧道 | ❌ | ❌ | ✅ |
 
-**当前只实现 Android 真机。** iOS 需要 macOS，尚未支持。
+iOS 的驱动同样走 `mobile-mcp` / `Mobilewright`，ming-qa 负责宿主检测、平台接入和证据契约。
+**一切 macOS 相关逻辑都未在 macOS 实测**——代码路径已就绪，真机/模拟器验证需要在 Mac 上做。
 
-宿主不支持时的行为：`doctor` 只列举当前平台可用的检测项——Windows / Linux 上 iOS 相关项**根本不在清单里**，不会产生无意义的报错。
+声明了 iOS 平台不会被静默当成 web 放行，也不会被要求安装 Android 的 adb。`doctor` 的检查项：
+
+| 检查项 | 通过条件 | 不通过时的下一步 |
+|---|---|---|
+| `mobile_ios_host` | 宿主是 macOS 且能找到 `xcrun` | 在 macOS 上执行，或改用 Android；安装 Xcode 并同意许可协议 |
+| `mobile_ios_simulators` | `xcrun simctl list devices available` 至少有一台模拟器 | Xcode → Settings → Platforms 安装 iOS Simulator Runtime |
+| `mobile_ios_devices` | `idevice_id -l` 或 `xcrun xctrace list devices` 至少有一台 iPhone/iPad | 连接设备、在手机上点「信任」 |
+
+Windows / Linux 上只会出现失败的 `mobile_ios_host`，不会去执行任何 iOS 命令。
+`--require-mobile-e2e` 且项目没有 task 时按 Android 检查；只声明 iOS 的项目不会被要求装 adb，
+`install-mobile-e2e` 也会跳过 Android Platform Tools。
+
+真机列表优先用 `idevice_id -l`（libimobiledevice，输出最稳）；没有它才解析
+`xcrun xctrace list devices`。xctrace 的输出把 Mac 和 iPhone 混在同一段，解析时靠机型名
+排除 Mac——**如果 Mac 被重命名成不含机型关键词的名字，可能被误判成 iOS 设备**。
+在 macOS 上实测时先用 `idevice_id` 或 Xcode 的设备窗口交叉确认。
 
 ## 环境准备
 
@@ -129,10 +153,22 @@ mobile_get_device_logs             # 崩溃 / 异常取证
 用于沉淀可回归的测试蓝图：
 
 - 生成 spec 到 `tests/e2e-mobile/<module>/`
-- 运行：`npx mobilewright test --project=android`
+- 运行：
+
+  ```bash
+  python "$QA_AGENT_DIR/scripts/qa_agent.py" run-mobile-e2e \
+    --repo . --spec tests/e2e-mobile/<module>/<case-id>.spec.ts \
+    --case-id TC-P0-001 --task-id SPEC-TC-P0-001-E2E-001
+  ```
+
+  它执行 `npx mobilewright test --project=android <spec>`，并把 stdout / stderr /
+  exit code 写成与 `run-e2e` 同构的 run sidecar——回归执行和首次执行落在同一条证据链上，
+  `aggregate-runs` 不需要区分驱动。iOS 用 `--project ios`（具体名称以
+  `mobilewright.config.ts` 为准）。
+
 - 配置：`mobilewright.config.ts`
 
-> Mobilewright 目前处于 0.0.x，API 可能变动。**它的细节不进 CLI，只在本参考里维护**——这样它 breaking 时只需要改这份文档。
+> Mobilewright 目前处于 0.0.x，API 可能变动。**它的细节不进 CLI，只在本参考里维护**——这样它 breaking 时只需要改这份文档。`run-mobile-e2e` 只固定「怎么调起来、怎么记证据」，不封装它的 API。
 
 ## 证据契约
 
@@ -141,10 +177,74 @@ mobile_get_device_logs             # 崩溃 / 异常取证
 | 证据 | 来源 | 用途 |
 |---|---|---|
 | view tree 快照 | `mobile_list_elements_on_screen` | 断言的实际依据，可离线复核 |
-| 截图 | `mobile_take_screenshot` | 人可读的现场 |
-| device log | `mobile_get_device_logs`（logcat） | 崩溃与异常的唯一真相 |
+| 截图 | `mobile_save_screenshot` | 人可读的现场（用原始分辨率那份） |
+| device log | `mobile_get_device_logs`（Android: logcat；iOS: syslog） | 崩溃与异常的唯一真相 |
 
-落盘路径：`.qa-agent/runs/<run-id>/mobile/<scope>/`
+落盘路径：`.qa-agent/runs/<run-id>/mobile/<scope>/`，并写一份 `manifest.json`：
+
+```json
+{
+  "caseId": "TC-P0-001",
+  "taskId": "SPEC-TC-P0-001-E2E-001",
+  "device": "R58M12345",
+  "platform": "android-real",
+  "locator": "tree",
+  "fallbackReason": "",
+  "durationMs": 12345,
+  "evidence": {
+    "viewTree": "view-tree.json",
+    "screenshot": "screen.png",
+    "logcat": "logcat.txt"
+  }
+}
+```
+
+- `caseId` 必填；`taskId` 可选，同一用例拆成多条 task 时用它精确对应。
+- `device` 必填——多设备环境下不写设备，这次执行不可复现。
+- `locator` 必填，取值 `tree`（无障碍树定位）或 `screenshot`（截图坐标兜底）。
+- `locator: screenshot` 时 `fallbackReason` 必填，写清为什么元素树不可用。
+  用截图不违规，**不写原因才违规**。
+- `durationMs` 必填，非负整数——本次执行的实际耗时（毫秒）。报告会汇总累计耗时和
+  单条最长耗时，让「跑得慢」变成可量化的数字，而不是感觉。
+- 三个证据路径相对 `manifest.json` 所在目录；文件必须真实存在且非空。
+- 截图必须是图片文件（`.png` / `.jpg` / `.jpeg` / `.webp`）。
+- 设备日志键：Android 写 `logcat`；iOS 写 `deviceLog`（或 `syslog`）。门禁三者等价，
+  不改契约、不强迫 iOS 用 Android 的键名。
+- **设备日志含崩溃特征是 `passed` 的负向门禁**：`FATAL EXCEPTION`、`ANR in`、
+  `E/AndroidRuntime`、`Terminating app due to uncaught exception` 等一旦命中，
+  即使三类证据齐全也判失败。证据不能只证明「跑过」，还要证明「没崩」。
+
+### 断言 -> 证据映射
+
+移动端 task 的每条 oracle 断言都必须标明由哪类证据支撑：
+
+```json
+"evidenceRefs": {
+  "viewTree": ["按钮状态符合预期", "列表项数量为 3"],
+  "screenshot": ["自绘棋盘的落子位置正确"],
+  "logcat": ["本次执行没有崩溃或 ANR"]
+}
+```
+
+- 键取 `viewTree` / `screenshot` / `logcat`（iOS 可用 `deviceLog` / `syslog`）。
+- 值是该证据支撑的断言原文，必须与 `oracle` 里的 `assertion` 完全一致。
+- 门禁只校验「每条断言都有映射」，映射得对不对由代码审查判断——
+  机械能查的部分不放过，需要人判断的部分不假装能查。
+
+门禁：
+
+```bash
+python "$QA_AGENT_DIR/scripts/qa_agent.py" assert-mobile-evidence \
+  --repo . --spec-tasks .qa-agent/current/test-spec-tasks.json
+```
+
+`assert-evidence-integrity` 会自动合并这项校验（它默认从 `--repo` 扫描
+`.qa-agent/runs/**/mobile/**/manifest.json`）。readiness 读的是
+`evidence-integrity-check.json`，所以**少一类证据，最终报告就是 Not Ready / Incomplete**，
+不是只打一条警告。
+
+只有 `executionStatus == "passed"` 的移动端 task 需要证据。`blocked` / `failed` /
+`not-run` 由各自的语义约束（blocker 证据、失败日志），不在这里重复判。
 
 ## 失败分类补充
 

@@ -114,7 +114,8 @@ json，原始 manifest 只列路径——判断「上一轮走到哪、缺什么
    - 另一条常见路径是让用户把服务起起来。先问清楚：这个服务本次 scope 用得到吗？用得到就起，用不到才豁免。
 4. **工具链门禁**：结合 scope（步骤 1）和 doctor 检查结果（步骤 3），判定本次验收的必需工具链：
    - scope 涉及前端 E2E（浏览器操作 / UI 流程）→ Playwright **运行时**为必须项（`@playwright/test` 声明 + 已安装 + `playwright.config` + 浏览器二进制，对应 doctor 的 `playwright_runtime` / `playwright_browsers` 两项须为 OK）。`playwright_assets` 里的 agents 定义（planner/generator/healer）是可选增强，只在需要生成/修复 spec 时才要求
-   - scope 涉及 Android 客户端（`platform: android-real` 的 task）→ 移动端工具链为必须项（doctor 的 `mobile_adb` / `mobile_devices` / `mobile_mcp` 三项；adb 缺失、设备未授权、mobile-mcp 未注册都算未就绪）
+   - scope 涉及 Android 客户端（`platform: android-real` 或 `android-emulator` 的 task）→ 移动端工具链为必须项（doctor 的 `mobile_adb` / `mobile_devices` / `mobile_mcp` 三项；adb 缺失、设备未授权、mobile-mcp 未注册都算未就绪）
+   - scope 涉及 iOS（`platform: ios-sim` / `ios-real`）→ 必须项为 `doctor` 的 `mobile_ios_host`（macOS + Xcode）、`mobile_ios_simulators`（声明模拟器时）或 `mobile_ios_devices`（声明真机时）。非 macOS 上宿主项必然失败——如实告知，不要绕过，也不要把 iOS task 改标成 web 来“跑通”。iOS 驱动由 mobile-mcp / Mobilewright 负责，ming-qa 未在 macOS 实测
    - scope 涉及数据库资金 / 状态验证 → MySQL MCP 为必须项
    - scope 为纯 API 验收或纯单元测试 → 三者均为可选项
    - **必须项缺失**：按 `config` 的 `toolchain.autoInstall` 决策——`true` 则自动执行 `install-playwright-runtime`（装 `@playwright/test` + 浏览器 + 自动生成 `playwright.config`）、`install-mysql-mcp` 和 `install-mobile-e2e`（装 mobile-mcp + adb，装好继续）；`install-playwright-agents` 只装 agents 定义，需生成/修复 spec 时才执行。`false`（默认）则告知缺什么 + 询问"我可以自动装，要装吗？"

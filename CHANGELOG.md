@@ -16,6 +16,26 @@
   Android Platform Tools（包管理器不可用时回退到 Google 官方 CDN 下载）
 - `install-mobile-e2e` 安装输出会打印 adb 落盘路径，并在 adb 不在 PATH 时明确提示——
   mobile-mcp 等第三方工具只认 PATH；新增 `--add-to-path` 写入用户 PATH（Windows，幂等）
+- 移动端证据门禁：标记 `passed` 的移动端 task 必须有元素树快照、截图、logcat 三类证据的
+  `manifest.json`，缺任何一类都会让 `assert-evidence-integrity` 失败（readiness 随之
+  Incomplete / Not Ready）。新增 `assert-mobile-evidence` 单独校验
+- 新增 `run-mobile-e2e`：执行 `npx mobilewright test` 并写与 `run-e2e` 同构的 run 证据
+- `platform` 支持 `android-emulator`；`ios-sim` / `ios-real` 会被识别并进入 iOS 检测分支，
+  不再有静默当成 web 的可能
+- iOS 接入：`doctor` 在 macOS 上检查 Xcode / `simctl` / `idevice_id` / `xctrace`；
+  非 macOS 明确失败。`install-mobile-e2e --with-ios` 输出 Xcode 人工准备步骤；
+  移动端证据契约接受 iOS 的 `deviceLog` / `syslog` 日志键。
+  **macOS 相关逻辑未实测**，见 `docs/TODO.md`
+- 移动端证据清单新增 `locator` / `fallbackReason` / `durationMs`：截图兜底必须写原因；
+  缺耗时直接失败。报告新增「移动端 E2E」区块，展示 task 数、证据清单数、累计/最长耗时、
+  树定位与截图兜底数量
+- 移动端 oracle 断言新增 `evidenceRefs` 映射：每条断言必须标明由元素树 / 截图 / 设备日志
+  哪一类支撑；缺映射或断言未映射都会让 `assert-evidence-integrity` 失败
+- 设备日志崩溃负向门禁：`FATAL EXCEPTION` / `ANR in` / `E/AndroidRuntime` / iOS
+  uncaught exception 等命中时，即使三类证据齐全也不能判 `passed`
+- run sidecar 新增 `durationMs`，`aggregate-runs` 同步聚合耗时
+- `doctor` 的 `mobile_adb` / `mobile_devices` / `mobile_mcp` 在项目存在 Android task 时
+  统一为阻断项，修正此前「设备项阻断、adb 项不阻断」的不一致
 
 ## [2.0.0] - 2026-09-16
 

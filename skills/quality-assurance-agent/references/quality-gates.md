@@ -42,6 +42,8 @@ Pass when:
 
 - Critical user flows are covered by E2E or explicitly justified as not automatable.
 - E2E tests assert real API responses for submit/state-changing actions, not only DOM transitions.
+- Mobile tasks marked `passed` carry all three evidence kinds (view tree, screenshot, device log) in a `mobile/.../manifest.json`, plus `locator`, `durationMs`, and one `evidenceRefs` entry per oracle assertion. Screenshot fallback requires `fallbackReason`. Any missing kind or mapping fails evidence integrity. Android uses `logcat`, iOS uses `deviceLog` / `syslog`.
+- Device logs with crash/ANR signatures (`FATAL EXCEPTION`, `ANR in`, `E/AndroidRuntime`, iOS uncaught exception) fail a task even when all evidence files are present.
 - Artifacts such as HTML report, trace, screenshots, or videos are linked when available.
 - Playwright Test Agents installed/listed is environment readiness; it only supports G4 and does not pass G4 by itself.
 

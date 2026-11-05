@@ -54,7 +54,10 @@ description: >
 - 需要数据库验证的 integration 层：先读取 `$QA_AGENT_DIR/references/mysql-mcp-integration.md` 了解查库方法，跑脚本后**按 `oracle.db` 结构化逐条校验**，记录「查询摘要 + 期望 + 实际 + 状态」到 evidence
 - `verificationMode: direct-db` 的数据完整性 task：直接通过 MySQL MCP `read_query` 执行 `oracle.db[].query`，逐条断言，不允许降级为「手工核对通过」
 - e2e 层：先读取 `$QA_AGENT_DIR/references/playwright-agent-integration.md` 了解 Playwright 规划器/生成器/修复器流程，通过 Playwright MCP 真实浏览器操作（navigate → login → click → snapshot → network_requests）
-- 移动端 e2e 层（`platform: android-real`）：先读取 `$QA_AGENT_DIR/references/mobile-e2e-integration.md` 确认宿主环境与平台限制，再选择 mobile-mcp 直驱（日常执行）或 `@mobilewright/test`（沉淀资产）
+- 移动端 e2e 层（`platform: android-real` / `android-emulator` / `ios-sim` / `ios-real`）：先读取 `$QA_AGENT_DIR/references/mobile-e2e-integration.md` 确认宿主环境与平台限制，再选择 mobile-mcp 直驱（日常执行）或 `@mobilewright/test`（沉淀资产）。回归执行走 `qa_agent.py run-mobile-e2e`，与首次执行写同构的 run sidecar
+- 移动端 task 标记 `passed` 前，必须把三类证据落到 `.qa-agent/runs/<run-id>/mobile/<scope>/` 并写 `manifest.json`：`caseId`、`device`、`locator`（`tree` / `screenshot`）、`durationMs`、`viewTree`、`screenshot`、设备日志（Android 用 `logcat`，iOS 用 `deviceLog` / `syslog`）。用截图兜底时还必须写 `fallbackReason`。`assert-evidence-integrity` 会校验；缺任何一类、缺耗时、缺降级原因，最终报告都不能通过
+- 移动端 task 的每条 oracle 断言都要在 `evidenceRefs` 里标明由哪类证据支撑（`viewTree` / `screenshot` / `logcat`），否则 `assert-evidence-integrity` 报 `mobile-assertion-without-evidence`
+- 设备日志里出现 `FATAL EXCEPTION` / `ANR in` / `E/AndroidRuntime` / iOS uncaught exception 等崩溃特征时，task **不能**标 `passed`；门禁会直接判失败
 
 **E2E 障碍处理、执行路径、环境变量、MySQL MCP 降级**：详见 `references/e2e-troubleshooting.md`。
 
@@ -171,5 +174,6 @@ python "$QA_AGENT_DIR/scripts/qa_agent.py"save-knowledge --repo . --module <mod
 - **禁止以"前端代码无变更"为由不执行 E2E task**。E2E 验证的是运行时行为（弹窗、登录态、网络请求），不是静态代码。源代码没变不等于运行时环境没变（新增弹窗、缓存策略调整等），必须重新在真实浏览器中跑一遍。
 - **E2E 用例必须走真实 UI 操作**。禁止用 `browser_evaluate` 直接调用 API 代替点击/输入/导航。弹窗遮挡就关弹窗，元素不可点击就 scroll/wait，应用层有缓存就调接口刷新——修环境，不降级测试方式。
 - **移动端 task 必须基于 accessibility tree 定位**，禁止退化为截图找坐标。坐标点击仅作元素树无法覆盖时的降级手段，且必须在 evidence 中标注降级原因。
+- **移动端 task 不许在没有三类证据时标 `passed`**。元素树快照、截图、logcat 少一样，`assert-evidence-integrity` 会失败，报告只能落在 Incomplete / Not Ready。不要用一张截图冒充全部证据，也不要把日志改名成 `.png` 骗过文件类型检查。
 - **不临时变更 spec-task 的 layer 或断言**。如果 API 层 task 跑不过，不能降级为"手动验证通过"。如果 E2E 层 task 跑不过，不能绕过浏览器改用 curl。计划是什么 layer，就用什么 layer 执行。如果环境确实不支持（如 E2E 依赖 Playwright 但不可用），标记 blocked 并记录原因，不偷偷换方案。**首次执行和回归执行同等约束。**
 - **E2E task 无独立脚本时的处理**：若 `targetFile` 以 `@` 开头（如 `@agent:playwright-mcp`、`@agent:mobile-mcp`），表示该 task 由 agent 直接驱动、**没有脚本文件**。此时若对应 runner 不可用，标记 task 为 `blocked`，在 `blocker` 里写清是哪个 runner 不可用，在 `nextAction` 里写「需生成独立脚本到 `tests/e2e.../`」。**不要现场手写脚本凑数**——那是脚本生成阶段的职责。

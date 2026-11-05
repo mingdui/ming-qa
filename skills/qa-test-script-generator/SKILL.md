@@ -128,7 +128,9 @@ E2E fixture（`tests/e2e/lib/e2e-fixture.js`）由 `init-project` 首次部署�
 
 ## 移动端 E2E 输出约定
 
-`platform: android-real` 的 task 走独立目录与独立驱动，不复用 Web 的 `tests/e2e/`。
+`platform: android-real` / `android-emulator` 的 task 走独立目录与独立驱动，不复用 Web 的 `tests/e2e/`。
+`ios-sim` / `ios-real` 已接入检测与证据契约，但需要 macOS + Xcode 且尚未实测——
+只有在用户明确要求 iOS 时才生成，并在计划里标注宿主前提。
 
 移动端有**两种执行形态**，`targetFile` 必须如实反映是哪一种：
 
@@ -147,7 +149,12 @@ E2E fixture（`tests/e2e/lib/e2e-fixture.js`）由 `init-project` 首次部署�
 > **怎么选**：scope 只要求「跑通一次」用 ②；要求「可回归」用 ③。③ 需要额外调通
 > `@mobilewright/test`（`install-mobile-e2e --with-mobilewright`）。
 
-`platform` 缺省为 `web`；只有 scope 明确涉及 Android 客户端时才生成 `android-real` task。
+`platform` 缺省为 `web`；只有 scope 明确涉及移动端时才生成 `android-real` / `android-emulator`
+（iOS 仅在用户明确要求时生成，并标注 macOS + Xcode 前提）。
+
+移动端 task 必须带 `evidenceRefs`：把每条 oracle 断言原文映射到 `viewTree` / `screenshot` /
+`logcat`（iOS 可用 `deviceLog` / `syslog`）。没有映射的断言会在执行阶段被
+`assert-evidence-integrity` 判失败。
 
 ## 容错与降级
 

@@ -11,7 +11,7 @@
       "sourceCaseId": "TC-P0-001",
       "priority": "P0|P1|P2|P3",
       "layer": "unit|integration|api|e2e",
-      "platform": "web|android-real",
+      "platform": "web|android-real|android-emulator|ios-sim|ios-real",
       "targetFile": "tests/api/module/tc-p0-001.sh",
       "testName": "可读的测试名称",
       "command": "可复制粘贴执行的命令",
@@ -22,6 +22,11 @@
         "db": ["数据库验证基准"],
         "sideEffects": [],
         "negativeAssertions": ["负向断言"]
+      },
+      "evidenceRefs": {
+        "viewTree": ["UI 断言原文"],
+        "screenshot": ["自绘 UI 断言原文"],
+        "logcat": ["无崩溃 / 无 ANR 断言原文"]
       },
       "data": {
         "pendingId": "<PENDING_ID>",
@@ -37,5 +42,10 @@
 }
 ```
 
-`platform` 缺省为 `web`。取值 `android-real` 表示 Android 真机 E2E——执行细节见 `references/mobile-e2e-integration.md`。
-`ios-sim` 预留但需要 macOS，本期未实现。
+`platform` 缺省为 `web`。`android-real` / `android-emulator` 表示 Android 移动端 E2E；
+`ios-sim` / `ios-real` 已接入检测与证据契约，但需要 macOS + Xcode，且**尚未实测**。
+执行细节见 `references/mobile-e2e-integration.md`。
+
+`evidenceRefs` 是移动端 task 的必填映射：每条 oracle 断言的原文都要出现在
+`viewTree` / `screenshot` / `logcat`（iOS 可用 `deviceLog` / `syslog`）之一的数组里。
+门禁只校验映射是否齐全，映射是否合理由代码审查判断。

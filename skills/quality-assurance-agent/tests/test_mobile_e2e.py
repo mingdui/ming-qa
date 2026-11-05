@@ -16,6 +16,11 @@
 from __future__ import annotations
 
 import json
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 
 def _fake_adb(monkeypatch, qa, stdout: str, *, which: str | None = "/usr/bin/adb"):
@@ -384,3 +389,340 @@ def test_adb_step_reports_path(qa, tmp_path, monkeypatch):
     result = qa.install_mobile_e2e_in_repo(tmp_path, with_adb=True)
     adb_step = next(s for s in result["steps"] if s["step"] == "adb")
     assert adb_step.get("detail") or adb_step.get("path")
+
+
+# --- ⑪ 平台枚举：Android 模拟器与 iOS 必须被识别，不能被当成 web ---
+
+
+def test_android_emulator_is_a_mobile_platform(qa, tmp_path):
+    repo = _write_spec_tasks(tmp_path, [
+        {"id": "T1", "layer": "e2e", "platform": "android-emulator"},
+    ])
+    assert [t["id"] for t in qa._mobile_platform_tasks(repo)] == ["T1"]
+
+
+def test_ios_platform_is_recognized_not_silently_web(qa, tmp_path):
+    """声明了 iOS 就必须进入移动端分支，否则会被静默当成 web 放行。"""
+    repo = _write_spec_tasks(tmp_path, [
+        {"id": "T1", "layer": "e2e", "platform": "ios-sim"},
+    ])
+    assert [t["id"] for t in qa._mobile_platform_tasks(repo)] == ["T1"]
+
+
+def test_doctor_requires_android_only_for_android_tasks(qa):
+    req = qa._mobile_doctor_requirements([{"platform": "android-real"}], False)
+    assert req["android"] is True
+    assert req["ios"] is False
+
+
+def test_doctor_does_not_demand_adb_for_ios_only_tasks(qa):
+    """只声明 iOS 的项目不该被要求装 adb——那是另一条工具链。"""
+    req = qa._mobile_doctor_requirements([{"platform": "ios-real"}], False)
+    assert req["android"] is False
+    assert req["ios"] is True
+
+
+def test_doctor_flag_without_tasks_checks_android(qa):
+    """--require-mobile-e2e 没有 task 时按当前唯一实现的 Android 检查。"""
+    req = qa._mobile_doctor_requirements([], True)
+    assert req["android"] is True
+    assert req["ios"] is False
+
+
+def test_ios_detection_off_macos_is_honest(qa):
+    """非 macOS 直接判不可用，不做「也许能连」的猜测。"""
+    info = qa._detect_ios_devices(platform="win32")
+    assert info["available"] is False
+    assert "macOS" in info["reason"]
+
+
+def test_ios_detection_requires_xcrun(qa, monkeypatch):
+    monkeypatch.setattr(qa.shutil, "which", lambda name: None)
+    info = qa._detect_ios_devices(platform="darwin")
+    assert info["available"] is False
+    assert "xcrun" in info["reason"]
+
+
+def test_ios_detection_parses_simulators_and_devices(qa, monkeypatch):
+    monkeypatch.setattr(
+        qa.shutil, "which",
+        lambda name: f"/usr/bin/{name}" if name in {"xcrun", "idevice_id"} else None,
+    )
+    sim_json = json.dumps({"devices": {"iOS 17.0": [
+        {"name": "iPhone 15", "udid": "SIM-1", "state": "Booted"},
+    ]}})
+
+    def fake_run(cmd, cwd, timeout=20, **kwargs):
+        if cmd[1:3] == ["simctl", "list"]:
+            return {"exitCode": 0, "stdout": sim_json, "stderr": ""}
+        if Path(cmd[0]).name == "idevice_id":
+            return {"exitCode": 0, "stdout": "00008110-000A1C2E0E91801E\n", "stderr": ""}
+        return {"exitCode": 1, "stdout": "", "stderr": ""}
+
+    monkeypatch.setattr(qa, "run_cmd", fake_run)
+    info = qa._detect_ios_devices(platform="darwin")
+    assert info["available"] is True
+    assert info["simulators"][0]["udid"] == "SIM-1"
+    assert info["devices"][0]["udid"] == "00008110-000A1C2E0E91801E"
+
+
+def test_xctrace_parser_excludes_macs_and_simulators(qa):
+    """Mac 和模拟器不能混进 iOS 真机列表。"""
+    stdout = """
+== Devices ==
+MacBook Pro (17.0) (00000000-0000-0000-0000-000000000000)
+My Phone (17.0) (00008110-000A1C2E0E91801E)
+== Simulators ==
+iPhone 15 Simulator (17.0) (ABCD-1234-EFGH-5678-IJKL-9012)
+"""
+    devices = qa._parse_xctrace_devices(stdout)
+    assert [d["udid"] for d in devices] == ["00008110-000A1C2E0E91801E"]
+
+
+def test_ios_check_results_report_missing_simulator(qa):
+    info = {"macOS": True, "xcode": True, "simulators": [], "devices": [],
+            "reason": ""}
+    checks = {c[0]: c for c in qa._mobile_ios_check_results(info, True, False)}
+    assert checks["mobile_ios_host"][1] is True
+    assert checks["mobile_ios_simulators"][1] is False
+    assert "Simulator Runtime" in checks["mobile_ios_simulators"][3]
+
+
+def _run_doctor(qa, repo, json_path, monkeypatch):
+    """跑 doctor 并返回 checks；adb / mcp 打桩，避免依赖本机状态。"""
+    monkeypatch.setattr(qa, "_detect_adb_devices", lambda *a, **k: {
+        "available": True, "adbPath": "/usr/bin/adb", "devices": ["R1"],
+        "authorized": ["R1"], "unauthorized": [],
+    })
+    monkeypatch.setattr(qa, "_mobile_mcp_registered", lambda *a, **k: True)
+    args = qa.build_parser().parse_args([
+        "doctor", "--repo", str(repo), "--json", str(json_path),
+    ])
+    qa.doctor(args)
+    return json.loads(json_path.read_text(encoding="utf-8"))["checks"]
+
+
+def test_doctor_blocks_android_toolchain_when_task_exists(qa, tmp_path, monkeypatch):
+    """项目有 Android task 时，adb / 设备 / mobile-mcp 三项都必须是阻断项。
+
+    历史不一致：设备项会阻断，但 adb 项只有显式 flag 才阻断——adb 缺失时
+    设备项被跳过，结果整组都不拦。
+    """
+    _write_spec_tasks(tmp_path, [{"id": "T1", "layer": "e2e", "platform": "android-real"}])
+    checks = _run_doctor(qa, tmp_path, tmp_path / "doctor.json", monkeypatch)
+    mobile = {c["name"]: c for c in checks if c["name"].startswith("mobile_")}
+    assert set(mobile) == {"mobile_adb", "mobile_devices", "mobile_mcp"}
+    assert all(c["required"] is True for c in mobile.values())
+
+
+def test_doctor_blocks_ios_explicitly(qa, tmp_path, monkeypatch):
+    """只声明 iOS 时不检查 adb，但必须给出一个失败的 iOS 阻断项。"""
+    _write_spec_tasks(tmp_path, [{"id": "T1", "layer": "e2e", "platform": "ios-sim"}])
+    checks = _run_doctor(qa, tmp_path, tmp_path / "doctor.json", monkeypatch)
+    mobile = {c["name"]: c for c in checks if c["name"].startswith("mobile_")}
+    assert "mobile_ios_host" in mobile
+    assert mobile["mobile_ios_host"]["ok"] is False
+    assert mobile["mobile_ios_host"]["required"] is True
+    assert "mobile_adb" not in mobile, "只声明 iOS 不该要求装 Android 的 adb"
+
+
+def test_doctor_accepts_ios_when_macos_toolchain_ready(qa, tmp_path, monkeypatch):
+    """macOS + Xcode + 已启动模拟器时，iOS 检测项应通过。"""
+    _write_spec_tasks(tmp_path, [{"id": "T1", "layer": "e2e", "platform": "ios-sim"}])
+    monkeypatch.setattr(qa, "_detect_ios_devices", lambda *a, **k: {
+        "available": True, "platform": "darwin", "macOS": True, "xcode": True,
+        "simulators": [{"name": "iPhone 15", "udid": "SIM-1",
+                        "state": "Booted", "runtime": "iOS 17.0"}],
+        "devices": [], "reason": "",
+    })
+    checks = _run_doctor(qa, tmp_path, tmp_path / "doctor.json", monkeypatch)
+    mobile = {c["name"]: c for c in checks if c["name"].startswith("mobile_")}
+    assert mobile["mobile_ios_host"]["ok"] is True
+    assert mobile["mobile_ios_simulators"]["ok"] is True
+
+
+def test_doctor_requires_ios_real_device_when_task_declares_it(qa, tmp_path, monkeypatch):
+    _write_spec_tasks(tmp_path, [{"id": "T1", "layer": "e2e", "platform": "ios-real"}])
+    monkeypatch.setattr(qa, "_detect_ios_devices", lambda *a, **k: {
+        "available": True, "platform": "darwin", "macOS": True, "xcode": True,
+        "simulators": [{"name": "iPhone 15", "udid": "SIM-1",
+                        "state": "Booted", "runtime": "iOS 17.0"}],
+        "devices": [], "reason": "",
+    })
+    checks = _run_doctor(qa, tmp_path, tmp_path / "doctor.json", monkeypatch)
+    mobile = {c["name"]: c for c in checks if c["name"].startswith("mobile_")}
+    assert mobile["mobile_ios_devices"]["ok"] is False
+    assert "信任" in mobile["mobile_ios_devices"]["nextAction"]
+
+
+# --- ⑮ iOS 人工准备步骤 ---
+
+
+def _isolate_adb(qa, monkeypatch):
+    monkeypatch.setattr(qa, "_detect_adb_devices", lambda *a, **k: {
+        "available": False, "adbPath": "", "devices": [],
+        "authorized": [], "unauthorized": [],
+    })
+    monkeypatch.setattr(qa, "_adb_manual_steps", lambda *a, **k: [])
+
+
+def test_with_ios_reports_manual_steps(qa, tmp_path, monkeypatch):
+    _isolate_adb(qa, monkeypatch)
+    result = qa.install_mobile_e2e_in_repo(
+        tmp_path, dry_run=True, with_adb=False, with_ios=True,
+    )
+    step = next(s for s in result["steps"] if s["step"] == "ios")
+    assert step["status"] == "manual"
+    assert any("Xcode" in item for item in result["manualSteps"])
+
+
+def test_ios_task_triggers_manual_ios_step_without_flag(qa, tmp_path, monkeypatch):
+    """项目里声明了 iOS task 时，安装命令要主动报出 Xcode 的人工步骤。"""
+    _isolate_adb(qa, monkeypatch)
+    _write_spec_tasks(tmp_path, [{"id": "T1", "layer": "e2e", "platform": "ios-real"}])
+    result = qa.install_mobile_e2e_in_repo(tmp_path, dry_run=True, with_adb=False)
+    assert any(s["step"] == "ios" for s in result["steps"])
+    assert any("Xcode" in item for item in result["manualSteps"])
+
+
+# --- ⑫ Mobilewright 回归执行 ---
+
+
+def _mobile_spec(tmp_path):
+    spec = tmp_path / "tests" / "e2e-mobile" / "app" / "tc-p0-001.spec.ts"
+    spec.parent.mkdir(parents=True)
+    spec.write_text("// mobilewright spec", encoding="utf-8")
+    return spec
+
+
+def _mobile_args(tmp_path, spec, **overrides):
+    values = dict(
+        repo=str(tmp_path), spec=str(spec), project=None,
+        case_id="TC-P0-001", task_id="SPEC-TC-P0-001-E2E-001",
+        extra=[], timeout=5,
+    )
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def test_run_mobile_e2e_builds_mobilewright_command(qa, tmp_path, monkeypatch):
+    spec = _mobile_spec(tmp_path)
+    seen = {}
+
+    def fake_run(cmd, **kwargs):
+        seen["cmd"] = cmd
+        seen["cwd"] = kwargs.get("cwd")
+        return SimpleNamespace(returncode=0, stdout="PASS", stderr="")
+
+    monkeypatch.setattr(qa, "find_npx", lambda: "/usr/bin/npx")
+    monkeypatch.setattr(qa.subprocess, "run", fake_run)
+
+    qa.run_mobile_e2e(_mobile_args(tmp_path, spec))
+
+    assert seen["cmd"][:5] == ["/usr/bin/npx", "mobilewright", "test", "--project", "android"]
+    assert seen["cmd"][5] == str(spec)
+    assert seen["cwd"] == str(tmp_path)
+
+
+def test_run_mobile_e2e_records_sidecar(qa, tmp_path, monkeypatch):
+    spec = _mobile_spec(tmp_path)
+    monkeypatch.setattr(qa, "find_npx", lambda: "/usr/bin/npx")
+    monkeypatch.setattr(
+        qa.subprocess, "run",
+        lambda *a, **kw: SimpleNamespace(returncode=0, stdout="PASS", stderr=""),
+    )
+
+    qa.run_mobile_e2e(_mobile_args(tmp_path, spec))
+
+    sidecars = list((tmp_path / ".qa-agent" / "runs").glob("*.meta.json"))
+    assert sidecars, "回归执行没有写 sidecar，aggregate-runs 会漏掉这次执行"
+    data = json.loads(sidecars[0].read_text(encoding="utf-8"))
+    assert data["caseId"] == "TC-P0-001"
+    assert data["taskId"] == "SPEC-TC-P0-001-E2E-001"
+    assert data["outcome"] == "PASS"
+    assert isinstance(data.get("durationMs"), int), "sidecar 要记录耗时，否则「跑得慢」无法量化"
+    assert data["durationMs"] >= 0
+
+
+def test_run_mobile_e2e_failure_still_records_evidence(qa, tmp_path, monkeypatch):
+    """失败也要留证据——只在成功时记录，失败就查不清了。"""
+    spec = _mobile_spec(tmp_path)
+    monkeypatch.setattr(qa, "find_npx", lambda: "/usr/bin/npx")
+    monkeypatch.setattr(
+        qa.subprocess, "run",
+        lambda *a, **kw: SimpleNamespace(returncode=1, stdout="", stderr="boom"),
+    )
+
+    with pytest.raises(SystemExit):
+        qa.run_mobile_e2e(_mobile_args(tmp_path, spec))
+
+    sidecars = list((tmp_path / ".qa-agent" / "runs").glob("*.meta.json"))
+    assert sidecars
+    assert json.loads(sidecars[0].read_text(encoding="utf-8"))["outcome"] == "FAIL"
+
+
+def test_run_mobile_e2e_missing_spec_is_readable(qa, tmp_path):
+    with pytest.raises(qa.QaAgentError) as exc:
+        qa.run_mobile_e2e(_mobile_args(tmp_path, tmp_path / "nope.spec.ts"))
+    assert "脚本不存在" in str(exc.value)
+
+
+def test_run_mobile_e2e_requires_npx(qa, tmp_path, monkeypatch):
+    spec = _mobile_spec(tmp_path)
+    monkeypatch.setattr(qa, "find_npx", lambda: None)
+    with pytest.raises(qa.QaAgentError) as exc:
+        qa.run_mobile_e2e(_mobile_args(tmp_path, spec))
+    assert "npx" in str(exc.value)
+
+
+# --- ⑬ Mobilewright 安装步骤 ---
+
+
+def test_with_mobilewright_dry_run_reports_step(qa, tmp_path):
+    result = qa.install_mobile_e2e_in_repo(
+        tmp_path, dry_run=True, with_adb=False, with_mobilewright=True,
+    )
+    step = next(s for s in result["steps"] if s["step"] == "mobilewright")
+    assert step["status"] == "dry-run"
+    assert "@mobilewright/test" in step["command"]
+
+
+# --- ⑭ 写用户 PATH 的逻辑（用假 winreg，不碰真实注册表）---
+
+
+def _fake_winreg(stored):
+    class Key:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def open_key(*args, **kwargs):
+        return Key()
+
+    def query(key, name):
+        return stored["Path"], 2
+
+    def set_value(key, name, reserved, kind, value):
+        stored["Path"] = value
+
+    return SimpleNamespace(
+        HKEY_CURRENT_USER=1, KEY_READ=1, KEY_SET_VALUE=2, REG_EXPAND_SZ=2,
+        OpenKey=open_key, QueryValueEx=query, SetValueEx=set_value,
+    )
+
+
+def test_add_to_user_path_windows_appends(qa, tmp_path, monkeypatch):
+    stored = {"Path": "C:\\existing"}
+    monkeypatch.setitem(sys.modules, "winreg", _fake_winreg(stored))
+    result = qa._add_to_user_path(tmp_path, platform="windows")
+    assert result["status"] == "passed"
+    assert str(tmp_path) in stored["Path"]
+
+
+def test_add_to_user_path_windows_is_idempotent(qa, tmp_path, monkeypatch):
+    stored = {"Path": "C:\\existing"}
+    monkeypatch.setitem(sys.modules, "winreg", _fake_winreg(stored))
+    qa._add_to_user_path(tmp_path, platform="windows")
+    assert qa._add_to_user_path(tmp_path, platform="windows")["status"] == "skipped"

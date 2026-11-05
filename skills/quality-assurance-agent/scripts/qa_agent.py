@@ -1206,11 +1206,29 @@ def _detect_adb_devices(repo: Path, timeout: int = 15) -> dict[str, Any]:
     return info
 
 
-def _mobile_platform_tasks(repo: Path) -> list[dict[str, Any]]:
-    """读取 current/test-spec-tasks.json，返回 platform == "android-real" 的 task。
+# 平台取值：web 是缺省；移动端四种目标里，Android 两种共用 adb 通路，
+# iOS 两种需要 macOS + Xcode，本工具包尚未实现。声明了 iOS 必须显式失败，
+# 不能被静默当成 web 放行——那会让「方案支持」看起来像「已经能跑」。
+PLATFORM_WEB = "web"
+PLATFORM_ANDROID_REAL = "android-real"
+PLATFORM_ANDROID_EMULATOR = "android-emulator"
+PLATFORM_IOS_SIM = "ios-sim"
+PLATFORM_IOS_REAL = "ios-real"
+ANDROID_PLATFORMS = frozenset({PLATFORM_ANDROID_REAL, PLATFORM_ANDROID_EMULATOR})
+IOS_PLATFORMS = frozenset({PLATFORM_IOS_SIM, PLATFORM_IOS_REAL})
+MOBILE_PLATFORMS = ANDROID_PLATFORMS | IOS_PLATFORMS
 
-    缺省 platform 视为 web（存量数据零迁移）。文件缺失或损坏时返回空列表——
-    检测逻辑不能因为读不到文件就抛异常。
+
+def _mobile_task_platform(task: dict[str, Any]) -> str:
+    """取 task 的平台标识；缺省 web（存量数据零迁移）。"""
+    return str(task.get("platform") or PLATFORM_WEB).strip().lower()
+
+
+def _mobile_platform_tasks(repo: Path) -> list[dict[str, Any]]:
+    """读取 current/test-spec-tasks.json，返回所有移动端 task。
+
+    缺省 platform 视为 web。文件缺失或损坏时返回空列表——检测逻辑不能因为
+    读不到文件就抛异常。
     """
     path = repo / ".qa-agent" / "current" / "test-spec-tasks.json"
     if not path.exists():
@@ -1224,8 +1242,595 @@ def _mobile_platform_tasks(repo: Path) -> list[dict[str, Any]]:
         return []
     return [
         task for task in tasks
-        if isinstance(task, dict) and (task.get("platform") or "web") == "android-real"
+        if isinstance(task, dict) and _mobile_task_platform(task) in MOBILE_PLATFORMS
     ]
+
+
+def _mobile_doctor_requirements(
+    mobile_tasks: list[dict[str, Any]], require_flag: bool = False
+) -> dict[str, Any]:
+    """按 task 的平台决定 doctor 要检查哪一组。"""
+    android_tasks = [t for t in mobile_tasks if _mobile_task_platform(t) in ANDROID_PLATFORMS]
+    ios_sim_tasks = [t for t in mobile_tasks if _mobile_task_platform(t) == PLATFORM_IOS_SIM]
+    ios_real_tasks = [t for t in mobile_tasks if _mobile_task_platform(t) == PLATFORM_IOS_REAL]
+    return {
+        "android": bool(android_tasks) or (bool(require_flag) and not mobile_tasks),
+        "ios": bool(ios_sim_tasks or ios_real_tasks),
+        "iosSim": bool(ios_sim_tasks),
+        "iosReal": bool(ios_real_tasks),
+        "androidTasks": android_tasks,
+        "iosTasks": ios_sim_tasks + ios_real_tasks,
+    }
+
+
+# xctrace 的 `== Devices ==` 段里同时列 Mac 和 iPhone/iPad。名字是用户可改的，
+# 不能只认 "iPhone" 前缀；用机型关键词排除 Mac，再要求行尾带 UDID。
+_XCTRACE_DEVICE_RE = re.compile(
+    r"^(?P<name>.+?)\s+\((?P<os>[^()]+)\)\s+\((?P<udid>[0-9A-Fa-f-]{25,})\)\s*$"
+)
+_MAC_MODEL_HINTS = ("MacBook", "Mac mini", "Mac Studio", "iMac", "Mac Pro")
+
+
+def _parse_xctrace_devices(stdout: str) -> list[dict[str, str]]:
+    """从 `xcrun xctrace list devices` 的输出里提取 iOS 真机。
+
+    只解析 `== Devices ==` 段（`== Simulators ==` 之前），并排除 Mac 机型。
+    解析失败的行走忽略——宁可少列一台，也不能把 Mac 当成 iPhone。
+    """
+    devices: list[dict[str, str]] = []
+    in_devices = False
+    for raw_line in (stdout or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("=="):
+            in_devices = line.lower().startswith("== devices")
+            continue
+        if not in_devices:
+            continue
+        if any(hint in line for hint in _MAC_MODEL_HINTS):
+            continue
+        match = _XCTRACE_DEVICE_RE.match(line)
+        if not match:
+            continue
+        devices.append({
+            "name": match.group("name").strip(),
+            "os": match.group("os").strip(),
+            "udid": match.group("udid").strip(),
+        })
+    return devices
+
+
+def _detect_ios_devices(
+    platform: str | None = None, timeout: int = 20
+) -> dict[str, Any]:
+    """检测 iOS 宿主与设备。
+
+    iOS 的硬前提是 macOS + Xcode。非 macOS 直接返回不可用，不做「也许能连」
+    的猜测；macOS 上再分别检查 simctl（模拟器）和 idevice_id / xctrace（真机）。
+
+    真机驱动本身由 mobile-mcp / Mobilewright 负责，这里只回答「环境够不够」。
+    """
+    plat = platform or sys.platform
+    info: dict[str, Any] = {
+        "available": False,
+        "platform": plat,
+        "macOS": plat == "darwin",
+        "xcode": False,
+        "simulators": [],
+        "devices": [],
+        "reason": "",
+    }
+    if plat != "darwin":
+        info["reason"] = "iOS 需要 macOS + Xcode；当前宿主不是 macOS"
+        return info
+
+    xcrun = shutil.which("xcrun")
+    if not xcrun:
+        info["reason"] = "未找到 xcrun；请安装 Xcode 并执行 sudo xcodebuild -license accept"
+        return info
+    info["xcode"] = True
+    # adb 同样的理由：工具会在 cwd 写日志，不在目标 repo 下跑。
+    workdir = Path(tempfile.gettempdir())
+
+    simctl = run_cmd(
+        [xcrun, "simctl", "list", "devices", "available", "--json"],
+        workdir, timeout=timeout,
+    )
+    if simctl.get("exitCode") == 0:
+        try:
+            data = json.loads(simctl.get("stdout") or "{}")
+            runtimes = data.get("devices") if isinstance(data, dict) else None
+            if isinstance(runtimes, dict):
+                for runtime, entries in runtimes.items():
+                    if not isinstance(entries, list):
+                        continue
+                    for entry in entries:
+                        if not isinstance(entry, dict):
+                            continue
+                        info["simulators"].append({
+                            "name": str(entry.get("name") or ""),
+                            "udid": str(entry.get("udid") or ""),
+                            "state": str(entry.get("state") or ""),
+                            "runtime": str(runtime),
+                        })
+        except (json.JSONDecodeError, TypeError):
+            info["reason"] = "xcrun simctl 输出无法解析"
+    else:
+        info["reason"] = "xcrun simctl 不可用；请确认 Xcode 已安装并同意许可协议"
+
+    # 真机：优先 libimobiledevice（输出最简单），其次 xctrace（Xcode 自带）。
+    idevice_id = shutil.which("idevice_id")
+    if idevice_id:
+        listed = run_cmd([idevice_id, "-l"], workdir, timeout=timeout)
+        if listed.get("exitCode") == 0:
+            for line in (listed.get("stdout") or "").splitlines():
+                udid = line.strip()
+                if udid:
+                    info["devices"].append({
+                        "name": "iOS device", "os": "", "udid": udid,
+                    })
+    if not info["devices"]:
+        trace = run_cmd([xcrun, "xctrace", "list", "devices"], workdir, timeout=timeout)
+        if trace.get("exitCode") == 0:
+            info["devices"] = _parse_xctrace_devices(trace.get("stdout") or "")
+
+    info["available"] = bool(info["simulators"] or info["devices"])
+    if not info["available"] and not info["reason"]:
+        info["reason"] = "未发现可用的 iOS 模拟器或真机"
+    return info
+
+
+def _mobile_ios_check_results(
+    info: dict[str, Any], need_sim: bool, need_real: bool
+) -> list[tuple[str, bool, str, str]]:
+    """把 iOS 检测结果转成 doctor 的检查项（name, ok, detail, nextAction）。"""
+    if not info.get("macOS"):
+        return [(
+            "mobile_ios_host", False,
+            "iOS 需要 macOS + Xcode；当前宿主不是 macOS",
+            "在 macOS 上执行，或改用 android-real / android-emulator",
+        )]
+    if not info.get("xcode"):
+        return [(
+            "mobile_ios_host", False,
+            info.get("reason") or "未找到 xcrun",
+            "安装 Xcode 并执行 sudo xcodebuild -license accept",
+        )]
+
+    checks: list[tuple[str, bool, str, str]] = [
+        ("mobile_ios_host", True, "macOS + Xcode 可用", ""),
+    ]
+    if need_sim:
+        simulators = info.get("simulators") or []
+        booted = [s for s in simulators if s.get("state") == "Booted"]
+        if simulators:
+            detail = f"{len(simulators)} 个可用模拟器"
+            if booted:
+                detail += f"，已启动 {len(booted)} 个：{', '.join(s.get('name', '') for s in booted[:3])}"
+            else:
+                detail += "，当前没有已启动的（执行 xcrun simctl boot <udid>）"
+            checks.append(("mobile_ios_simulators", True, detail, ""))
+        else:
+            checks.append((
+                "mobile_ios_simulators", False,
+                info.get("reason") or "未发现可用模拟器",
+                "打开 Xcode → Settings → Platforms，安装 iOS Simulator Runtime",
+            ))
+    if need_real:
+        devices = info.get("devices") or []
+        if devices:
+            checks.append((
+                "mobile_ios_devices", True,
+                f"{len(devices)} 台 iOS 真机：{', '.join(d.get('name', '') for d in devices[:3])}",
+                "",
+            ))
+        else:
+            checks.append((
+                "mobile_ios_devices", False,
+                "未发现 iOS 真机",
+                "连接 iPhone，在设备上点「信任」，并确认 Xcode → Window → Devices 能看到它",
+            ))
+    return checks
+
+
+# === 移动端证据门禁 ===
+#
+# 证据契约（view tree + screenshot + logcat）原先只写在文档里，代码层没有校验，
+# 「少一样报告不通过」实际上不成立。这里把它变成门禁：标记为 passed 的移动端
+# task，必须在 .qa-agent/runs/<run-id>/mobile/<scope>/manifest.json 里给出三条
+# 证据的落盘路径，且文件真实存在、非空。
+MOBILE_EVIDENCE_KINDS = ("viewTree", "screenshot", "logcat")
+# Android 用 logcat，iOS 用 syslog/deviceLog——语义都是「设备日志」。
+# 清单里写哪个键都接受，避免为了平台差异改契约。
+MOBILE_EVIDENCE_ALIASES = {
+    "logcat": ("logcat", "deviceLog", "syslog"),
+}
+MOBILE_EVIDENCE_LABELS = {
+    "viewTree": "元素树快照",
+    "screenshot": "截图",
+    "logcat": "设备日志（logcat / syslog）",
+}
+MOBILE_SCREENSHOT_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp"})
+MOBILE_LOCATORS = ("tree", "screenshot")
+# 判 passed 时设备日志里不能出现的崩溃特征。宁可按行精确匹配，也不做模糊推断。
+MOBILE_CRASH_PATTERNS = (
+    "FATAL EXCEPTION",
+    "ANR in ",
+    "E/AndroidRuntime",
+    "Terminating app due to uncaught exception",
+    "Fatal error:",
+    "EXC_CRASH",
+)
+MOBILE_LOG_READ_LIMIT = 2 * 1024 * 1024
+
+
+def _mobile_log_artifact(manifest: dict[str, Any]) -> Path | None:
+    """取清单里的设备日志文件路径（兼容 logcat / deviceLog / syslog）。"""
+    evidence = manifest.get("evidence")
+    if not isinstance(evidence, dict):
+        return None
+    for alias in MOBILE_EVIDENCE_ALIASES["logcat"]:
+        raw = evidence.get(alias)
+        if isinstance(raw, str) and raw.strip():
+            artifact = Path(raw.strip())
+            if not artifact.is_absolute():
+                artifact = manifest["_manifestPath"].parent / artifact
+            return artifact
+    return None
+
+
+def _scan_mobile_log_crashes(manifest: dict[str, Any]) -> list[dict[str, Any]]:
+    """扫描设备日志里的崩溃/ANR 特征。
+
+    日志存在但内容有崩溃，而 task 又标了 passed——这是「AI 验证对不对」最典型的
+    反例：证据齐了，但证据本身否定了结论。这里把它变成负向门禁。
+    """
+    artifact = _mobile_log_artifact(manifest)
+    if artifact is None or not artifact.exists():
+        return []
+    try:
+        text = artifact.read_bytes()[:MOBILE_LOG_READ_LIMIT].decode("utf-8", "replace")
+    except OSError:
+        return []
+    matches: list[str] = []
+    for line in text.splitlines():
+        if any(pattern in line for pattern in MOBILE_CRASH_PATTERNS):
+            matches.append(line.strip()[:300])
+            if len(matches) >= 10:
+                break
+    if not matches:
+        return []
+    return [{
+        "type": "mobile-logcat-crash",
+        "severity": "fail",
+        "caseId": str(manifest.get("caseId") or "").strip().upper(),
+        "path": str(artifact),
+        "matches": matches,
+        "message": "设备日志包含崩溃/ANR 特征，但 task 标记为 passed",
+    }]
+
+
+def _mobile_oracle_assertions(task: dict[str, Any]) -> list[str]:
+    """收集 task 里所有 oracle 断言文本（ui/api/db/sideEffects/negative）。"""
+    oracle = task.get("oracle")
+    if not isinstance(oracle, dict):
+        return []
+    assertions: list[str] = []
+    for items in oracle.values():
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if isinstance(item, dict):
+                text = item.get("assertion")
+                if isinstance(text, str) and text.strip():
+                    assertions.append(text.strip())
+            elif isinstance(item, str) and item.strip():
+                assertions.append(item.strip())
+    return list(dict.fromkeys(assertions))
+
+
+def _validate_mobile_evidence_refs(task: dict[str, Any]) -> list[dict[str, Any]]:
+    """每条 oracle 断言都必须标明由哪类证据支撑。
+
+    只校验「有没有映射」，不校验「映射得对不对」——后者是代码审查的判断。
+    这正是门禁该守的边界：能机械检查的部分不放过，需要人判断的部分不假装。
+    """
+    assertions = _mobile_oracle_assertions(task)
+    if not assertions:
+        return []
+    task_id = str(task.get("id") or "")
+    case_id = str(task.get("sourceCaseId") or "")
+    refs = task.get("evidenceRefs")
+    if not isinstance(refs, dict) or not refs:
+        return [{
+            "type": "mobile-evidence-refs-missing",
+            "severity": "fail",
+            "taskId": task_id,
+            "sourceCaseId": case_id,
+            "assertions": assertions[:10],
+            "message": "移动端 task 缺少 evidenceRefs：每条 oracle 断言都要标明由哪类证据支撑",
+        }]
+    valid_kinds = set(MOBILE_EVIDENCE_KINDS) | set(MOBILE_EVIDENCE_ALIASES["logcat"])
+    mapped: set[str] = set()
+    for kind, items in refs.items():
+        if kind not in valid_kinds:
+            continue
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if isinstance(item, str) and item.strip():
+                mapped.add(item.strip())
+    missing = [assertion for assertion in assertions if assertion not in mapped]
+    if not missing:
+        return []
+    return [{
+        "type": "mobile-assertion-without-evidence",
+        "severity": "fail",
+        "taskId": task_id,
+        "sourceCaseId": case_id,
+        "assertions": missing[:10],
+        "message": f"{len(missing)} 条 oracle 断言没有 evidenceRefs 映射",
+    }]
+
+
+def _iter_mobile_evidence_manifests(repo: Path) -> list[Path]:
+    """列出 runs 下所有位于 mobile 目录内的 manifest.json。"""
+    runs = repo / ".qa-agent" / "runs"
+    if not runs.exists():
+        return []
+    found: list[Path] = []
+    for path in runs.rglob("manifest.json"):
+        try:
+            relative = path.relative_to(runs)
+        except ValueError:
+            continue
+        if "mobile" in relative.parts:
+            found.append(path)
+    return sorted(found)
+
+
+def _validate_mobile_manifest(manifest: dict[str, Any]) -> list[dict[str, Any]]:
+    """校验单份证据清单；返回 findings（空列表表示这份清单合格）。"""
+    path: Path = manifest["_manifestPath"]
+    case_id = str(manifest.get("caseId") or "").strip().upper()
+    if not case_id:
+        return [{
+            "type": "mobile-evidence-manifest-invalid",
+            "severity": "fail",
+            "path": str(path),
+            "message": "证据清单缺少 caseId，无法与 spec-task 对应",
+        }]
+    findings: list[dict[str, Any]] = []
+    device = str(manifest.get("device") or "").strip()
+    if not device:
+        findings.append({
+            "type": "mobile-evidence-device-missing",
+            "severity": "fail",
+            "caseId": case_id,
+            "path": str(path),
+            "message": "证据清单缺少 device；多设备环境下无法复现这次执行",
+        })
+    locator = str(manifest.get("locator") or "").strip().lower()
+    if locator not in MOBILE_LOCATORS:
+        findings.append({
+            "type": "mobile-evidence-locator-invalid",
+            "severity": "fail",
+            "caseId": case_id,
+            "path": str(path),
+            "message": "证据清单必须声明 locator：tree（无障碍树）或 screenshot（截图兜底）",
+        })
+    elif locator == "screenshot" and not str(manifest.get("fallbackReason") or "").strip():
+        findings.append({
+            "type": "mobile-evidence-fallback-reason-missing",
+            "severity": "fail",
+            "caseId": case_id,
+            "path": str(path),
+            "message": "使用截图坐标兜底时必须写 fallbackReason（为什么元素树不可用）",
+        })
+    duration = manifest.get("durationMs")
+    if isinstance(duration, bool) or not isinstance(duration, (int, float)) or duration < 0:
+        findings.append({
+            "type": "mobile-evidence-duration-missing",
+            "severity": "fail",
+            "caseId": case_id,
+            "path": str(path),
+            "message": "证据清单必须提供非负的 durationMs（本次执行耗时，毫秒）",
+        })
+    evidence = manifest.get("evidence")
+    if not isinstance(evidence, dict):
+        findings.append({
+            "type": "mobile-evidence-missing",
+            "severity": "fail",
+            "caseId": case_id,
+            "kind": "evidence",
+            "path": str(path),
+            "message": "证据清单缺少 evidence 对象",
+        })
+        return findings
+    for kind in MOBILE_EVIDENCE_KINDS:
+        label = MOBILE_EVIDENCE_LABELS[kind]
+        raw = None
+        for alias in MOBILE_EVIDENCE_ALIASES.get(kind, (kind,)):
+            candidate = evidence.get(alias)
+            if isinstance(candidate, str) and candidate.strip():
+                raw = candidate
+                break
+        if raw is None:
+            findings.append({
+                "type": "mobile-evidence-missing",
+                "severity": "fail",
+                "caseId": case_id,
+                "kind": kind,
+                "path": str(path),
+                "message": f"缺少{label}证据",
+            })
+            continue
+        artifact = Path(raw.strip())
+        if not artifact.is_absolute():
+            artifact = path.parent / artifact
+        if not artifact.exists():
+            findings.append({
+                "type": "mobile-evidence-missing",
+                "severity": "fail",
+                "caseId": case_id,
+                "kind": kind,
+                "path": str(artifact),
+                "message": f"{label}证据文件不存在：{raw}",
+            })
+            continue
+        if artifact.stat().st_size <= 0:
+            findings.append({
+                "type": "mobile-evidence-empty",
+                "severity": "fail",
+                "caseId": case_id,
+                "kind": kind,
+                "path": str(artifact),
+                "message": f"{label}证据文件为空：{raw}",
+            })
+            continue
+        if kind == "screenshot" and artifact.suffix.lower() not in MOBILE_SCREENSHOT_SUFFIXES:
+            findings.append({
+                "type": "mobile-evidence-screenshot-not-image",
+                "severity": "fail",
+                "caseId": case_id,
+                "kind": kind,
+                "path": str(artifact),
+                "message": f"截图证据不是图片文件：{raw}",
+            })
+    return findings
+
+
+def assert_mobile_evidence_data(
+    spec_tasks_data: dict[str, Any], repo: Path
+) -> dict[str, Any]:
+    """移动端证据门禁：passed 的移动端 task 必须有三类证据的清单与文件。
+
+    只有 passed 的 task 才要求证据。blocked / failed / not-run 由各自的语义
+    （blocker 证据、失败日志）负责，不能在这里重复判。
+    """
+    tasks = spec_tasks_data.get("tasks") if isinstance(spec_tasks_data, dict) else None
+    if not isinstance(tasks, list):
+        tasks = []
+    mobile_tasks = [
+        task for task in tasks
+        if isinstance(task, dict) and _mobile_task_platform(task) in MOBILE_PLATFORMS
+    ]
+
+    manifests: list[dict[str, Any]] = []
+    findings: list[dict[str, Any]] = []
+    for path in _iter_mobile_evidence_manifests(repo):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            findings.append({
+                "type": "mobile-evidence-manifest-invalid",
+                "severity": "fail",
+                "path": str(path),
+                "message": f"证据清单无法解析：{exc}",
+            })
+            continue
+        if not isinstance(data, dict):
+            findings.append({
+                "type": "mobile-evidence-manifest-invalid",
+                "severity": "fail",
+                "path": str(path),
+                "message": "证据清单必须是 JSON 对象",
+            })
+            continue
+        data["_manifestPath"] = path
+        manifest_findings = _validate_mobile_manifest(data)
+        findings.extend(manifest_findings)
+        if not manifest_findings:
+            manifests.append(data)
+
+    by_case: dict[str, list[dict[str, Any]]] = {}
+    by_task: dict[str, list[dict[str, Any]]] = {}
+    for manifest in manifests:
+        case_id = str(manifest.get("caseId") or "").strip().upper()
+        if case_id:
+            by_case.setdefault(case_id, []).append(manifest)
+        task_id = str(manifest.get("taskId") or "").strip()
+        if task_id:
+            by_task.setdefault(task_id, []).append(manifest)
+
+    passed_tasks = [
+        task for task in mobile_tasks
+        if normalize_task_status(task.get("executionStatus")) == "passed"
+    ]
+    scanned_manifests: set[str] = set()
+    for task in passed_tasks:
+        # 断言 -> 证据的映射：结论必须说清是哪类证据支撑的。
+        findings.extend(_validate_mobile_evidence_refs(task))
+        case_id = str(task.get("sourceCaseId") or "").strip().upper()
+        task_id = str(task.get("id") or "").strip()
+        matched = by_task.get(task_id) or (by_case.get(case_id) if case_id else [])
+        if not matched:
+            findings.append({
+                "type": "mobile-evidence-manifest-missing",
+                "severity": "fail",
+                "taskId": task_id,
+                "sourceCaseId": case_id,
+                "message": (
+                    f"移动端 task {task_id or case_id} 已标记 passed，"
+                    "但找不到通过校验的证据清单 manifest.json"
+                ),
+            })
+            continue
+        for manifest in matched:
+            manifest_key = str(manifest.get("_manifestPath"))
+            if manifest_key in scanned_manifests:
+                continue
+            scanned_manifests.add(manifest_key)
+            # 证据存在不等于结论正确：日志里有崩溃却标 passed，直接判失败。
+            findings.extend(_scan_mobile_log_crashes(manifest))
+
+    durations = [
+        m.get("durationMs") for m in manifests
+        if isinstance(m.get("durationMs"), (int, float))
+        and not isinstance(m.get("durationMs"), bool)
+    ]
+    status = "failed" if any(f.get("severity") == "fail" for f in findings) else "passed"
+    return {
+        "version": "1.0",
+        "generatedAt": utc_now(),
+        "status": status,
+        "summary": {
+            "mobileTasks": len(mobile_tasks),
+            "passedMobileTasks": len(passed_tasks),
+            "manifests": len(manifests),
+            "locatorTree": sum(
+                1 for m in manifests if str(m.get("locator") or "").lower() == "tree"
+            ),
+            "locatorScreenshot": sum(
+                1 for m in manifests if str(m.get("locator") or "").lower() == "screenshot"
+            ),
+            "totalDurationMs": int(sum(durations)),
+            "maxDurationMs": int(max(durations)) if durations else 0,
+            "findings": len(findings),
+        },
+        "findings": findings,
+    }
+
+
+def merge_gate_results(base: dict[str, Any], extra: dict[str, Any]) -> dict[str, Any]:
+    """把一个附加门禁的 findings 合并进主门禁结果。
+
+    用于把移动端证据校验挂到 evidence-integrity 上——readiness 只读
+    evidence-integrity-check.json，不合并的话移动端缺证据拦不住报告。
+    """
+    merged = dict(base)
+    findings = list(base.get("findings") or []) + list(extra.get("findings") or [])
+    merged["findings"] = findings
+    merged["status"] = "failed" if (
+        base.get("status") == "failed"
+        or extra.get("status") == "failed"
+        or any(f.get("severity") == "fail" for f in findings)
+    ) else "passed"
+    summary = dict(base.get("summary") or {})
+    summary["mobileEvidence"] = dict(extra.get("summary") or {})
+    merged["summary"] = summary
+    return merged
 
 
 def _mobile_mcp_registered(repo: Path) -> bool:
@@ -1244,7 +1849,7 @@ def _mobile_mcp_registered(repo: Path) -> bool:
 def should_check_mobile(repo: Path, require_flag: bool = False) -> bool:
     """是否进入移动端检测。
 
-    只有项目确有 android-real task 时才检测——否则一个纯后端项目跑 doctor
+    只有项目确有移动端 task 时才检测——否则一个纯后端项目跑 doctor
     会因为「没插手机」而失败。这与 services 探活「被标记为 required 才阻断」
     是同一个模式。
     """
@@ -1439,15 +2044,17 @@ def install_mobile_e2e_in_repo(
     with_adb: bool = True,
     with_mobilewright: bool = False,
     add_to_path: bool = False,
+    with_ios: bool = False,
 ) -> dict[str, Any]:
-    """准备 Android 真机 E2E 的工具链（幂等）。
+    """准备移动端 E2E 的工具链（幂等）。
 
     做三件事：
       1. 注册 mobile-mcp 到 .mcp.json（保留已有 server）
       2. 安装 Android Platform Tools（with_adb）
       3. 安装 @mobilewright/test（with_mobilewright）
 
-    无法自动化的部分（手机上的 USB 授权）在 manualSteps 里返回。
+    iOS 的 Xcode 无法由本命令自动安装；声明了 iOS task 或显式 `with_ios`
+    时，只输出人工准备步骤，不假装成功。
     """
     steps: list[dict[str, Any]] = []
     if dry_run:
@@ -1456,9 +2063,20 @@ def install_mobile_e2e_in_repo(
     else:
         steps.append({"step": "mobile-mcp", **_register_mobile_mcp(repo)})
 
+    tasks = _mobile_platform_tasks(repo)
+    android_tasks = [t for t in tasks if _mobile_task_platform(t) in ANDROID_PLATFORMS]
+    ios_tasks = [t for t in tasks if _mobile_task_platform(t) in IOS_PLATFORMS]
+    ios_only = bool(ios_tasks) and not android_tasks
+    if ios_only:
+        # 只有 iOS task 的项目不该被塞一套 Android 工具链；--no-adb 的提示也不适用。
+        with_adb = False
+
     adb_info = _detect_adb_devices(repo)
     if not with_adb:
-        steps.append({"step": "adb", "status": "skipped", "reason": "未请求安装（--no-adb）"})
+        reason = "未请求安装（--no-adb）"
+        if ios_only:
+            reason = "项目只有 iOS task，跳过 Android Platform Tools"
+        steps.append({"step": "adb", "status": "skipped", "reason": reason})
     elif adb_info["available"]:
         steps.append({"step": "adb", "status": "skipped", "reason": "adb 已可用",
                       "detail": adb_info["adbPath"]})
@@ -1515,9 +2133,27 @@ def install_mobile_e2e_in_repo(
             "执行 `mobilecli daemon stop` 后再列一次设备即可。"
         )
 
+    manual_steps = [] if ios_only else _adb_manual_steps(repo)
+    if with_ios or ios_tasks:
+        steps.append({
+            "step": "ios",
+            "status": "manual",
+            "reason": "Xcode 无法由 ming-qa 自动安装；按下面的 manualSteps 准备",
+        })
+        manual_steps.extend([
+            "在 macOS 上安装 Xcode（App Store），并执行 sudo xcodebuild -license accept",
+            "打开 Xcode → Settings → Platforms，安装 iOS Simulator Runtime",
+            "模拟器：执行 xcrun simctl boot <udid>；真机：连接 iPhone 并在设备上点「信任」",
+        ])
+        if sys.platform != "darwin":
+            notes.append(
+                "当前宿主不是 macOS——iOS 的检测与执行只能在 macOS 上进行；"
+                "本命令只输出准备步骤，不代表 iOS 已可用。"
+            )
+
     status = "failed" if any(s.get("status") == "failed" for s in steps) else "passed"
     return {"status": status, "steps": steps,
-            "manualSteps": _adb_manual_steps(repo), "notes": notes}
+            "manualSteps": manual_steps, "notes": notes}
 
 
 def install_mobile_e2e(args: argparse.Namespace) -> None:
@@ -1531,8 +2167,9 @@ def install_mobile_e2e(args: argparse.Namespace) -> None:
         with_adb=not bool(getattr(args, "no_adb", False)),
         with_mobilewright=bool(getattr(args, "with_mobilewright", False)),
         add_to_path=bool(getattr(args, "add_to_path", False)),
+        with_ios=bool(getattr(args, "with_ios", False)),
     )
-    print(f"Android 真机 E2E 工具链：{install['status']}")
+    print(f"移动端 E2E 工具链：{install['status']}")
     for step in install["steps"]:
         line = f"  [{step['status']}] {step['step']}"
         if step.get("reason"):
@@ -4963,9 +5600,35 @@ def assert_evidence_integrity(args: argparse.Namespace) -> None:
     latest_run_data = read_json(Path(args.run).resolve()) if getattr(args, "run", None) and Path(args.run).exists() else {}
     code_review_data = read_json(Path(args.code_review).resolve()) if getattr(args, "code_review", None) and Path(args.code_review).exists() else {}
     result = check_evidence_integrity(cases_data, spec_tasks_data, latest_run_data, code_review_data)
+    # 移动端证据契约挂在这个门禁上：readiness 只读这份产物，不合并的话
+    # 「少一样证据报告不通过」就只是文档里的一句话。
+    repo = Path(getattr(args, "repo", ".") or ".").resolve()
+    result = merge_gate_results(result, assert_mobile_evidence_data(spec_tasks_data, repo))
     if args.output:
         write_json(Path(args.output).resolve(), result)
     print(f"证据完整性门禁：{result['status']}（用例 {result['summary']['testCasesTotal']} / task {result['summary']['specTasksTotal']} / run {result['summary']['runCasesTotal']} / 未匹配 {result['summary']['unmatchedLogs']}）")
+    for finding in result.get("findings", [])[:20]:
+        print(f"  - {finding.get('type')}: {finding.get('message', '')}")
+    if result["status"] != "passed":
+        raise SystemExit(1)
+
+
+def assert_mobile_evidence(args: argparse.Namespace) -> None:
+    """只校验移动端证据契约，便于在渲染报告前单独排查。"""
+    spec_tasks_data = (
+        read_json(Path(args.spec_tasks).resolve())
+        if getattr(args, "spec_tasks", None) and Path(args.spec_tasks).exists()
+        else {}
+    )
+    result = assert_mobile_evidence_data(spec_tasks_data, Path(args.repo).resolve())
+    if args.output:
+        write_json(Path(args.output).resolve(), result)
+    summary = result["summary"]
+    print(
+        f"移动端证据门禁：{result['status']}"
+        f"（移动端 task {summary['mobileTasks']} / 已通过 {summary['passedMobileTasks']}"
+        f" / 合格清单 {summary['manifests']}）"
+    )
     for finding in result.get("findings", [])[:20]:
         print(f"  - {finding.get('type')}: {finding.get('message', '')}")
     if result["status"] != "passed":
@@ -5064,6 +5727,9 @@ def assert_readiness_data(
             "codeReviewStatus": review_check.get("status", "missing"),
             "reportFreshnessStatus": freshness_status or "missing",
             "evidenceIntegrityStatus": evidence_status or "missing",
+            "mobileEvidence": (evidence_integrity_data.get("summary") or {}).get(
+                "mobileEvidence", {}
+            ),
             "blockingCodeReviewFindings": review_check.get("summary", {}).get("blockingFindings", 0),
             "reportExists": bool(report_path.exists()) if report_path else None,
         },
@@ -6730,7 +7396,8 @@ def _derive_case_id(stem: str) -> str:
 
 def _record_run_sidecar(repo: Path, case_id: str, task_id: str, script_name: str,
                         return_code: int, stdout: str, stderr: str,
-                        case_ids: list[str] | None = None) -> None:
+                        case_ids: list[str] | None = None,
+                        duration_ms: int | None = None) -> None:
     """写 runs/run-*.log + run-*.meta.json（聚合唯一事实源）。"""
     runs_dir = repo / ".qa-agent" / "runs"
     runs_dir.mkdir(parents=True, exist_ok=True)
@@ -6764,6 +7431,8 @@ def _record_run_sidecar(repo: Path, case_id: str, task_id: str, script_name: str
         "executedAt": dt.datetime.now(_CN_TZ).isoformat(timespec="seconds"),
         "outcome": "PASS" if return_code == 0 else "FAIL",
     }
+    if duration_ms is not None:
+        sidecar["durationMs"] = max(0, int(duration_ms))
     sidecar_path = runs_dir / f"run-{case_id}-{slug}-{epoch}.meta.json"
     write_json(sidecar_path, sidecar)
     print(f"[ming-qa] 日志: {log_path}")
@@ -6829,9 +7498,11 @@ def run_with_env(args: argparse.Namespace) -> None:
     env_os.update(env_vars)
     env_os.update(extra_vars)
     env_os["PYTHONIOENCODING"] = "utf-8"
+    started = time.monotonic()
     result = sp.run(argv, cwd=str(repo), env=env_os,
                     capture_output=True, encoding="utf-8", errors="replace",
                     timeout=getattr(args, "timeout", 120))
+    duration_ms = int((time.monotonic() - started) * 1000)
     if result.stdout:
         print(result.stdout)
     if result.stderr:
@@ -6848,7 +7519,7 @@ def run_with_env(args: argparse.Namespace) -> None:
     _record_run_sidecar(
         repo, case_id, getattr(args, "task_id", None) or "",
         script_path.name, result.returncode, result.stdout, result.stderr,
-        case_ids=declared_ids,
+        case_ids=declared_ids, duration_ms=duration_ms,
     )
 
     if result.returncode != 0:
@@ -6892,9 +7563,11 @@ def run_e2e(args: argparse.Namespace) -> None:
 
     import subprocess as sp
     print(f"[run-e2e] {' '.join(cmd)} (cwd={pw_dir})")
+    started = time.monotonic()
     result = sp.run(cmd, cwd=str(pw_dir), env=env_os,
                     capture_output=True, encoding="utf-8", errors="replace",
                     timeout=getattr(args, "timeout", 180))
+    duration_ms = int((time.monotonic() - started) * 1000)
     if result.stdout:
         print(result.stdout)
     if result.stderr:
@@ -6910,6 +7583,72 @@ def run_e2e(args: argparse.Namespace) -> None:
     _record_run_sidecar(
         repo, case_id, getattr(args, "task_id", None) or "",
         spec.name, result.returncode, result.stdout, result.stderr,
+        duration_ms=duration_ms,
+    )
+
+    if result.returncode != 0:
+        raise SystemExit(result.returncode)
+
+
+def run_mobile_e2e(args: argparse.Namespace) -> None:
+    """执行 Mobilewright spec，并写 run 证据（log + sidecar）。
+
+    与 run-e2e 对称：run-e2e 跑 Playwright，这里跑 `npx mobilewright test`。
+    两者都写 runs/run-*.log + .meta.json，供 aggregate-runs 统一聚合——
+    回归执行必须和首次执行落在同一条证据链上。
+
+    注意：这条命令只负责执行与记录，不替 agent 生成证据清单。移动端的
+    三类证据（元素树 / 截图 / logcat）由执行阶段写入
+    `.qa-agent/runs/<run-id>/mobile/<scope>/manifest.json`，再由
+    `assert-mobile-evidence` 校验。
+    """
+    repo = Path(args.repo).resolve()
+    spec = Path(args.spec)
+    if not spec.is_absolute():
+        spec = (repo / spec).resolve()
+    if not spec.exists():
+        raise QaAgentError(f"脚本不存在: {spec}")
+
+    npx = find_npx()
+    if not npx:
+        raise QaAgentError("npx was not found in PATH; install Node.js/npm first")
+
+    project = getattr(args, "project", None) or "android"
+    cmd = [npx, "mobilewright", "test", "--project", project, str(spec)]
+
+    env_os = os.environ.copy()
+    env_os["PYTHONIOENCODING"] = "utf-8"
+    for key, val in _load_env(repo).items():
+        env_os[key] = val
+    for item in getattr(args, "extra", None) or []:
+        if "=" in item:
+            key, _, val = item.partition("=")
+            env_os[key] = val
+
+    print(f"[run-mobile-e2e] {' '.join(cmd)} (cwd={repo})")
+    started = time.monotonic()
+    result = subprocess.run(
+        cmd, cwd=str(repo), env=env_os,
+        capture_output=True, encoding="utf-8", errors="replace",
+        timeout=getattr(args, "timeout", 300),
+    )
+    duration_ms = int((time.monotonic() - started) * 1000)
+    if result.stdout:
+        print(result.stdout)
+    if result.stderr:
+        print(result.stderr, file=sys.stderr)
+
+    stem = spec.name
+    for suffix in (".spec.ts", ".spec.js", ".spec.tsx", ".spec.mjs"):
+        if stem.endswith(suffix):
+            stem = stem[: -len(suffix)]
+            break
+    explicit_case_id = (getattr(args, "case_id", None) or "").strip()
+    case_id = explicit_case_id or _derive_case_id(stem)
+    _record_run_sidecar(
+        repo, case_id, getattr(args, "task_id", None) or "",
+        spec.name, result.returncode, result.stdout, result.stderr,
+        duration_ms=duration_ms,
     )
 
     if result.returncode != 0:
@@ -7327,52 +8066,62 @@ def doctor(args: argparse.Namespace) -> None:
                     next_action="在 config/env.shared 配置 QA_WEB_BASE_URL",
                 )
 
-        # 移动端（Android 真机）：仅在项目确有 android-real task 时进入检测。
+        # 移动端：仅在项目确有移动端 task 时进入检测。
         # 一个纯 Web 项目不该因为「没插手机」而失败——这与 services 探活
         # 「被标记为 required 才阻断」是同一个模式。
         require_mobile = bool(getattr(args, "require_mobile_e2e", False))
         if should_check_mobile(repo, require_mobile):
             mobile_tasks = _mobile_platform_tasks(repo)
-            adb_info = _detect_adb_devices(repo)
-            add(
-                "mobile_adb",
-                adb_info["available"],
-                adb_info["adbPath"] or "未找到 adb；Android 真机测试需要它",
-                required=require_mobile,
-                next_action="" if adb_info["available"] else
-                "安装 Android Platform Tools（含 adb）并加入 PATH："
-                "https://developer.android.com/tools/releases/platform-tools",
-            )
-            if adb_info["available"]:
-                if adb_info["authorized"]:
-                    ok = True
-                    detail = f"{len(adb_info['authorized'])} 台已授权设备：{', '.join(adb_info['authorized'])}"
-                    action = ""
-                elif adb_info["unauthorized"]:
-                    ok = False
-                    detail = f"{len(adb_info['unauthorized'])} 台设备未授权：{', '.join(adb_info['unauthorized'])}"
-                    action = ("在手机屏幕上点「允许 USB 调试」；若弹窗未出现，拔插 USB 后执行 "
-                              "adb kill-server && adb devices 重新触发授权")
-                else:
-                    ok = False
-                    detail = "adb 可用但未发现设备"
-                    action = "用 USB 连接 Android 设备，并在开发者选项中开启 USB 调试"
+            requirements = _mobile_doctor_requirements(mobile_tasks, require_mobile)
+
+            if requirements["android"]:
+                adb_info = _detect_adb_devices(repo)
                 add(
-                    "mobile_devices",
-                    ok,
-                    detail,
-                    required=bool(mobile_tasks) or require_mobile,
-                    next_action=action,
+                    "mobile_adb",
+                    adb_info["available"],
+                    adb_info["adbPath"] or "未找到 adb；Android 移动端测试需要它",
+                    required=True,
+                    next_action="" if adb_info["available"] else
+                    "安装 Android Platform Tools（含 adb）并加入 PATH："
+                    "https://developer.android.com/tools/releases/platform-tools",
                 )
-            mcp_registered = _mobile_mcp_registered(repo)
-            add(
-                "mobile_mcp",
-                mcp_registered,
-                "mobile-mcp 已注册" if mcp_registered else "mobile-mcp 未注册",
-                required=require_mobile,
-                next_action="" if mcp_registered else
-                "claude mcp add mobile-mcp -- npx -y @mobilenext/mobile-mcp@latest",
-            )
+                if adb_info["available"]:
+                    if adb_info["authorized"]:
+                        ok = True
+                        detail = f"{len(adb_info['authorized'])} 台已授权设备：{', '.join(adb_info['authorized'])}"
+                        action = ""
+                    elif adb_info["unauthorized"]:
+                        ok = False
+                        detail = f"{len(adb_info['unauthorized'])} 台设备未授权：{', '.join(adb_info['unauthorized'])}"
+                        action = ("在手机屏幕上点「允许 USB 调试」；若弹窗未出现，拔插 USB 后执行 "
+                                  "adb kill-server && adb devices 重新触发授权")
+                    else:
+                        ok = False
+                        detail = "adb 可用但未发现设备"
+                        action = "用 USB 连接 Android 设备（或启动模拟器），并在开发者选项中开启 USB 调试"
+                    add(
+                        "mobile_devices",
+                        ok,
+                        detail,
+                        required=True,
+                        next_action=action,
+                    )
+                mcp_registered = _mobile_mcp_registered(repo)
+                add(
+                    "mobile_mcp",
+                    mcp_registered,
+                    "mobile-mcp 已注册" if mcp_registered else "mobile-mcp 未注册",
+                    required=True,
+                    next_action="" if mcp_registered else
+                    "claude mcp add mobile-mcp -- npx -y @mobilenext/mobile-mcp@latest",
+                )
+
+            if requirements["ios"]:
+                ios_info = _detect_ios_devices()
+                for name, ok, detail, action in _mobile_ios_check_results(
+                    ios_info, requirements["iosSim"], requirements["iosReal"]
+                ):
+                    add(name, ok, detail, required=True, next_action=action)
 
         # MySQL MCP 配置：仅 --config-mysql-mcp 时执行（doctor 默认只检查，不改配置），复用 configure_mysql_mcp 配两边
         if getattr(args, "config_mysql_mcp", False):
@@ -9081,6 +9830,11 @@ def _parse_run_sidecar(path: Path) -> dict[str, Any] | None:
         exit_code = int(data.get("exitCode", 0) or 0)
     except (TypeError, ValueError):
         exit_code = 0
+    raw_duration = data.get("durationMs")
+    try:
+        duration_ms = max(0, int(raw_duration)) if raw_duration is not None else None
+    except (TypeError, ValueError):
+        duration_ms = None
     return {
         "caseId": case_id,
         "caseIds": case_ids,
@@ -9092,6 +9846,7 @@ def _parse_run_sidecar(path: Path) -> dict[str, Any] | None:
         "epoch": epoch,
         "executedAt": str(data.get("executedAt", "") or ""),
         "exitCode": exit_code,
+        "durationMs": duration_ms,
         "outcome": str(data.get("outcome", "PASS" if exit_code == 0 else "FAIL") or ("PASS" if exit_code == 0 else "FAIL")),
         "hasStderrNoise": False,
     }
@@ -9930,6 +10685,7 @@ def aggregate_runs(args: argparse.Namespace) -> None:
                 "logFile": a["logFile"],
                 "executedAt": a["executedAt"],
                 "exitCode": a["exitCode"],
+                "durationMs": a.get("durationMs"),
                 "outcome": a["outcome"],
                 "hasStderrNoise": a["hasStderrNoise"],
             }
@@ -10016,6 +10772,39 @@ def _extract_cr_scope_files(cr_data: dict[str, Any]) -> list[str]:
     if scope is not None:
         print(f"警告：code-review.json 的 scope 应为对象 {{files:[]}}，当前为 {type(scope).__name__}，已忽略", file=sys.stderr)
     return []
+
+
+def _render_mobile_evidence(readiness_data: dict[str, Any]) -> str:
+    """渲染移动端证据与耗时；没有移动端 task 时不出这一节。"""
+    mobile = (readiness_data.get("summary") or {}).get("mobileEvidence") or {}
+    if not isinstance(mobile, dict):
+        return ""
+    mobile_tasks = int(mobile.get("mobileTasks", 0) or 0)
+    if mobile_tasks <= 0:
+        return ""
+    passed = int(mobile.get("passedMobileTasks", 0) or 0)
+    manifests = int(mobile.get("manifests", 0) or 0)
+    tree = int(mobile.get("locatorTree", 0) or 0)
+    screenshot = int(mobile.get("locatorScreenshot", 0) or 0)
+    total_ms = int(mobile.get("totalDurationMs", 0) or 0)
+    max_ms = int(mobile.get("maxDurationMs", 0) or 0)
+
+    def seconds(value: int) -> str:
+        return f"{value / 1000:.1f}s" if value else "—"
+
+    return f"""
+<section id="mobile-evidence">
+  <h2>移动端 E2E</h2>
+  <div class="cards">
+    <div class="card"><div class="label">移动端 task</div><div class="value">{mobile_tasks}</div></div>
+    <div class="card"><div class="label">已通过</div><div class="value">{passed}</div></div>
+    <div class="card"><div class="label">证据清单</div><div class="value">{manifests}</div></div>
+    <div class="card"><div class="label">累计耗时</div><div class="value">{seconds(total_ms)}</div></div>
+    <div class="card"><div class="label">单条最长</div><div class="value">{seconds(max_ms)}</div></div>
+    <div class="card"><div class="label">定位方式</div><div class="value">树 {tree} / 截图 {screenshot}</div></div>
+  </div>
+  <p style="color:var(--muted);font-size:13px;">截图兜底必须写 fallbackReason；设备日志含崩溃特征时不能判 passed。</p>
+</section>"""
 
 
 def render_report(args: argparse.Namespace) -> None:
@@ -10177,6 +10966,7 @@ def render_report(args: argparse.Namespace) -> None:
         _render_evidence_gap(all_cases),
         _render_unverified_cases(all_cases, spec_tasks_data),
         _render_executive_summary(scope, assertions, conditions_html, cr_notes, cr_next_steps, _render_gates(readiness_data, completion_data, cr_data), test_scripts, cr_scope_files, qa_fix_files),
+        _render_mobile_evidence(readiness_data),
         _render_code_review(cr_data, cr_scope_files),
         _render_risk(risk_data, project_risk_coverage(cases_data)),
         _render_case_matrix(in_scope, run_data, spec_tasks_data),
@@ -11261,13 +12051,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--output", default=".qa-agent/current/readiness-check.json")
     p.set_defaults(func=assert_readiness)
 
-    p = sub.add_parser("assert-evidence-integrity", help="fail when execution evidence chain is incomplete (empty run / unmatched logs / missing task runs)")
+    p = sub.add_parser("assert-evidence-integrity", help="fail when execution evidence chain is incomplete (empty run / unmatched logs / missing task runs / mobile evidence)")
+    p.add_argument("--repo", default=".", help="仓库根目录（移动端证据清单从这里扫描）")
     p.add_argument("--cases", help="test-cases.json 路径")
     p.add_argument("--spec-tasks", help="test-spec-tasks.json 路径")
     p.add_argument("--run", help="latest-run.json 路径")
     p.add_argument("--code-review", help="code-review.json 路径（校验 scope schema）")
     p.add_argument("--output", default=".qa-agent/current/evidence-integrity-check.json")
     p.set_defaults(func=assert_evidence_integrity)
+
+    p = sub.add_parser("assert-mobile-evidence", help="fail when a passed mobile task lacks view tree / screenshot / logcat evidence")
+    p.add_argument("--repo", default=".", help="仓库根目录（证据清单从 .qa-agent/runs 下扫描）")
+    p.add_argument("--spec-tasks", help="test-spec-tasks.json 路径")
+    p.add_argument("--output", default=".qa-agent/current/mobile-evidence-check.json")
+    p.set_defaults(func=assert_mobile_evidence)
 
     p = sub.add_parser("assert-report-freshness", help="fail when the rendered report is older than source gate artifacts")
     p.add_argument("--report", required=True)
@@ -11400,6 +12197,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--timeout", type=int, default=600)
     p.add_argument("--no-adb", action="store_true", help="跳过 Android Platform Tools 安装")
     p.add_argument("--with-mobilewright", action="store_true", help="一并安装 @mobilewright/test")
+    p.add_argument("--with-ios", action="store_true",
+                   help="输出 iOS（Xcode）的人工准备步骤；Xcode 无法自动安装")
     p.add_argument("--add-to-path", action="store_true",
                    help="把 platform-tools 加入用户 PATH（Windows 写注册表；幂等）")
     p.add_argument("--dry-run", action="store_true", help="仅打印命令不执行")
@@ -11518,6 +12317,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--project", default="", help="Playwright project（可选）")
     p.add_argument("--timeout", type=int, default=180, help="超时秒数")
     p.set_defaults(func=run_e2e)
+
+    p = sub.add_parser("run-mobile-e2e", help="执行 npx mobilewright test <spec> 并写 run 证据（log+sidecar）")
+    p.add_argument("--repo", default=".")
+    p.add_argument("--spec", required=True, help="Mobilewright spec 路径（相对于 --repo 或绝对路径）")
+    p.add_argument("--extra", nargs="*", default=[], help="额外环境变量（VAR=value 格式）")
+    p.add_argument("--case-id", help="用例 ID，写入 sidecar；缺省从 spec 文件名推断")
+    p.add_argument("--task-id", help="spec-task ID，写入 sidecar")
+    p.add_argument("--project", default="android", help="Mobilewright project（默认 android）")
+    p.add_argument("--timeout", type=int, default=300, help="超时秒数")
+    p.set_defaults(func=run_mobile_e2e)
 
     p = sub.add_parser("safe-write-json", help="写入 JSON 文件并立即做编码完整性检查（规避 Write/Edit 工具的中文编码损坏风险）")
     p.add_argument("path", help="目标 JSON 文件路径")

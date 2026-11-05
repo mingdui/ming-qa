@@ -113,7 +113,8 @@ python "$QA_AGENT_DIR/scripts/qa_agent.py" generate-spec-tasks \
 | 依赖 | 用途 | 不可用时 |
 |---|---|---|
 | Playwright 运行时 | 前端 E2E | 记录到 `environment-checks.json`；纯 API 验收不需要 |
-| Android 真机 / mobile-mcp | 移动端 E2E | 受影响 task 标记 blocked，原因写入 blocker |
+| Android 真机 / 模拟器 / mobile-mcp | 移动端 E2E | 受影响 task 标记 blocked，原因写入 blocker |
+| iOS + Xcode（macOS） | iOS 移动端 E2E | 受影响 task 标记 blocked；非 macOS 上明确不可用 |
 | MySQL MCP | 数据库资金/状态校验 | 降级为 API 替代验证，在 evidence 中标注信息损失 |
 | LLM 网关 | 多模型交叉审查 | 跳过该阶段，其余流程不受影响 |
 | 告警 webhook | 报告质量告警 | 不发送通知；发送失败只写 stderr，不阻断 |

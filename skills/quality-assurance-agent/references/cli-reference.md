@@ -14,6 +14,12 @@ python "$QA_AGENT_DIR/scripts/qa_agent.py"run-with-env --repo . --script <脚�
 # 在 playwrightDir（默认 tests/）执行 Playwright spec，并写 run 证据（log+sidecar，供 aggregate-runs 自动聚合）
 python "$QA_AGENT_DIR/scripts/qa_agent.py"run-e2e --repo . --spec tests/e2e/<module>/<case-id>.spec.ts [--extra KEY=VAL]...
 
+# 执行 Mobilewright spec（Android 回归资产），写同构的 run 证据
+python "$QA_AGENT_DIR/scripts/qa_agent.py"run-mobile-e2e --repo . --spec tests/e2e-mobile/<module>/<case-id>.spec.ts --case-id TC-P0-001 [--project android]
+
+# 单独校验移动端三类证据（元素树 / 截图 / logcat）；assert-evidence-integrity 会自动合并
+python "$QA_AGENT_DIR/scripts/qa_agent.py"assert-mobile-evidence --repo . --spec-tasks .qa-agent/current/test-spec-tasks.json
+
 # 安全写入 JSON 文件（规避 Windows Write 工具的中文 U+FFFD 编码损坏）
 python3 -c "..." | python "$QA_AGENT_DIR/scripts/qa_agent.py"safe-write-json <目标路径> --from-stdin
 
@@ -33,12 +39,16 @@ python "$QA_AGENT_DIR/scripts/qa_agent.py"doctor --repo . --strict --check-serv
 > Next.js workspace root 推断（导致动态路由 404）。`install-playwright-runtime` 自动装到该目录，
 > `run-e2e` 在该目录执行 spec。`playwright.config.js` 的 `testDir` 为 `./e2e`（相对 playwrightDir）。
 
-> **Android 真机 E2E**：scope 涉及 `platform: android-real` 的 task 时，执行
+> **移动端 E2E**：scope 涉及 `platform: android-real` / `android-emulator` 的 task 时，执行
 > `install-mobile-e2e --repo .`（注册 mobile-mcp 到 `.mcp.json` + 安装 Android Platform Tools）。
 > adb 优先用平台包管理器（winget / brew / apt），都没有时回退到 Google 官方 CDN 下载到
 > `~/.ming-qa/platform-tools`。**下载回退后必须把该目录加入 PATH**——mobile-mcp 等第三方工具
 > 只认 PATH，不会去 ming-qa 自管目录找 adb（用 `--add-to-path` 自动写入，需重开会话生效）。
 > 装完仍需人工完成手机上的 USB 授权，命令会作为 `manualSteps` 报出来。
+>
+> **iOS**：Xcode 无法自动安装。声明了 `ios-sim` / `ios-real` 时，安装命令会输出人工步骤
+> （`--with-ios` 可显式要求）；`doctor` 在 macOS 上检查 Xcode / `simctl` / 真机，
+> 非 macOS 直接失败。iOS 相关逻辑未在 macOS 实测。
 > 完整说明见 `references/mobile-e2e-integration.md`。
 
 ## 阶段 0：上下文
