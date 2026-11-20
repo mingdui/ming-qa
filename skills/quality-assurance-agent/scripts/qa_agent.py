@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import concurrent.futures
 import datetime as dt
 import fnmatch
@@ -19,6 +20,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+import uuid
 import xml.etree.ElementTree as ET
 import zipfile
 from pathlib import Path
@@ -171,6 +173,16 @@ SPEC_TASK_TERMINAL_EXECUTION_STATUS = {
 }
 DEFAULT_SPEC_TASK_TARGET_RATIO = {"unit": 0.60, "integration": 0.20, "api": 0.15, "e2e": 0.05}
 DEFAULT_SPEC_TASK_MIN_BY_PRIORITY = {"P0": 8, "P1": 5, "P2": 3, "P3": 1}
+# latest-run.json 里「不叫 PASS」的结论；task 写 passed 却落在这里就是自相矛盾。
+RUN_NOT_PASSED_OUTCOMES = frozenset({
+    "FAIL",
+    "FAILED",
+    "ERROR",
+    "TIMEOUT",
+    "BLOCKED",
+    "BLOCKED-ENV",
+    "SKIPPED",
+})
 MOJIBAKE_TEXT_EXTENSIONS = {
     ".cjs",
     ".css",
@@ -1463,6 +1475,13 @@ MOBILE_CRASH_PATTERNS = (
     "EXC_CRASH",
 )
 MOBILE_LOG_READ_LIMIT = 2 * 1024 * 1024
+# run-mobile-e2e 的子进程预算。420s 是历史默认值，但那时之后
+# test-timeout 提到了 240s 且 config 常见 retries=1，最坏 480s 会把进程杀在中途。
+MOBILE_E2E_DEFAULT_TIMEOUT_S = 300
+MOBILE_E2E_TIMEOUT_MARGIN_S = 120
+# 子进程超时统一记 124（timeout(1) 的约定），和「测试失败」的退出码区分开。
+# run-e2e 与 run-mobile-e2e 共用同一个码，见下方 RUN_TIMEOUT_EXIT_CODE。
+MOBILE_E2E_TIMEOUT_EXIT_CODE = 124
 
 
 def _mobile_log_artifact(manifest: dict[str, Any]) -> Path | None:
@@ -1530,11 +1549,18 @@ def _mobile_oracle_assertions(task: dict[str, Any]) -> list[str]:
     return list(dict.fromkeys(assertions))
 
 
-def _validate_mobile_evidence_refs(task: dict[str, Any]) -> list[dict[str, Any]]:
+def _validate_mobile_evidence_refs(
+    task: dict[str, Any], manifest: dict[str, Any] | None = None
+) -> list[dict[str, Any]]:
     """每条 oracle 断言都必须标明由哪类证据支撑。
 
     只校验「有没有映射」，不校验「映射得对不对」——后者是代码审查的判断。
     这正是门禁该守的边界：能机械检查的部分不放过，需要人判断的部分不假装。
+
+    给了 manifest 时再加两条机械检查（这两条原先漏掉了，导致「把同一串断言
+    复制到 viewTree 和 screenshot 两个键」就能全绿）：
+      * refs 声明由某类证据支撑，但 manifest 里那类证据根本没采到 → 直接判失败；
+      * 两类证据的断言清单逐字相同 → 记为 warning，多半是复制粘贴。
     """
     assertions = _mobile_oracle_assertions(task)
     if not assertions:
@@ -1551,26 +1577,188 @@ def _validate_mobile_evidence_refs(task: dict[str, Any]) -> list[dict[str, Any]]
             "assertions": assertions[:10],
             "message": "移动端 task 缺少 evidenceRefs：每条 oracle 断言都要标明由哪类证据支撑",
         }]
+    findings: list[dict[str, Any]] = []
     valid_kinds = set(MOBILE_EVIDENCE_KINDS) | set(MOBILE_EVIDENCE_ALIASES["logcat"])
     mapped: set[str] = set()
+    claimed: dict[str, list[str]] = {}
     for kind, items in refs.items():
-        if kind not in valid_kinds:
-            continue
         if not isinstance(items, list):
             continue
-        for item in items:
-            if isinstance(item, str) and item.strip():
-                mapped.add(item.strip())
+        canonical = _canonical_mobile_kind(kind)
+        texts = [item.strip() for item in items if isinstance(item, str) and item.strip()]
+        # 只有门禁真能核对的证据类型才算「已映射」；写了 network / trace 这类
+        # manifest 里根本不会出现的 kind，等于把断言挂在了不存在的证据上。
+        if kind in valid_kinds:
+            for text in texts:
+                mapped.add(text)
+        if texts:
+            claimed.setdefault(canonical, []).extend(texts)
     missing = [assertion for assertion in assertions if assertion not in mapped]
-    if not missing:
+    if missing:
+        findings.append({
+            "type": "mobile-assertion-without-evidence",
+            "severity": "fail",
+            "taskId": task_id,
+            "sourceCaseId": case_id,
+            "assertions": missing[:10],
+            "message": f"{len(missing)} 条 oracle 断言没有 evidenceRefs 映射",
+        })
+    if manifest is not None and claimed:
+        captured = _captured_mobile_kinds(manifest)
+        not_captured = sorted(kind for kind in claimed if kind not in captured)
+        if not_captured:
+            findings.append({
+                "type": "mobile-evidence-ref-kind-not-captured",
+                "severity": "fail",
+                "taskId": task_id,
+                "sourceCaseId": case_id,
+                "kinds": not_captured,
+                "message": (
+                    f"evidenceRefs 声明由 {', '.join(not_captured)} 支撑，"
+                    "但证据清单里没有采到这类证据"
+                ),
+            })
+        duplicated = _duplicated_mobile_ref_lists(claimed)
+        if duplicated:
+            findings.append({
+                "type": "mobile-evidence-refs-duplicated",
+                "severity": "warn",
+                "taskId": task_id,
+                "sourceCaseId": case_id,
+                "kinds": duplicated,
+                "message": (
+                    f"{' / '.join(duplicated)} 的断言清单逐字相同；"
+                    "两类证据支撑同一串断言时，至少有一类多半是复制来的"
+                ),
+            })
+    return findings
+
+
+def _canonical_mobile_kind(kind: str) -> str:
+    """把 deviceLog / syslog 归一到 logcat，其余原样。"""
+    for canonical, aliases in MOBILE_EVIDENCE_ALIASES.items():
+        if kind in aliases:
+            return canonical
+    return kind
+
+
+def _captured_mobile_kinds(manifest: dict[str, Any]) -> set[str]:
+    """manifest.evidence 里实际声明了哪些类证据（按规范名返回）。"""
+    evidence = manifest.get("evidence")
+    if not isinstance(evidence, dict):
+        return set()
+    captured: set[str] = set()
+    for kind, aliases in MOBILE_EVIDENCE_ALIASES.items():
+        for alias in aliases:
+            value = evidence.get(alias)
+            if isinstance(value, str) and value.strip():
+                captured.add(_canonical_mobile_kind(alias))
+                break
+    for kind in MOBILE_EVIDENCE_KINDS:
+        value = evidence.get(kind)
+        if isinstance(value, str) and value.strip():
+            captured.add(kind)
+    return captured
+
+
+def _duplicated_mobile_ref_lists(claimed: dict[str, list[str]]) -> list[str]:
+    """找出断言清单逐字相同（顺序无关）的两类证据。"""
+    seen: dict[tuple[str, ...], str] = {}
+    for kind in sorted(claimed):
+        key = tuple(sorted(set(claimed[kind])))
+        if not key:
+            continue
+        if key in seen:
+            return [seen[key], kind]
+        seen[key] = kind
+    return []
+
+
+def _log_file_name(raw: Any) -> str:
+    """从 logFile / runLog 里取文件名（旧数据可能带相对路径）。"""
+    if not isinstance(raw, str) or not raw.strip():
+        return ""
+    return Path(raw.strip().replace("\\", "/")).name
+
+
+def _mobile_run_logs(latest_run_data: dict[str, Any] | None) -> dict[str, set[str]]:
+    """caseId（大写）→ 本轮该 case 所有 attempt 的日志文件名。
+
+    移动端证据目录（runs/<ts>-<hex>/mobile/<scope>/）与 run 日志（runs/run-*.log）
+    是两套命名，靠 manifest 里的 runLog 才能把「这堆截图是谁的」绑定到某次执行。
+    """
+    logs: dict[str, set[str]] = {}
+    if not isinstance(latest_run_data, dict):
+        return logs
+    cases = latest_run_data.get("cases")
+    if not isinstance(cases, list):
+        return logs
+    for case in cases:
+        if not isinstance(case, dict):
+            continue
+        case_id = str(case.get("caseId") or "").strip().upper()
+        if not case_id:
+            continue
+        bucket = logs.setdefault(case_id, set())
+        for key in ("logFile", "runLog"):
+            name = _log_file_name(case.get(key))
+            if name:
+                bucket.add(name)
+        attempts = case.get("attempts")
+        if isinstance(attempts, list):
+            for attempt in attempts:
+                if isinstance(attempt, dict):
+                    name = _log_file_name(attempt.get("logFile"))
+                    if name:
+                        bucket.add(name)
+    return logs
+
+
+def _manifest_mtime(manifest: dict[str, Any]) -> float:
+    try:
+        return manifest["_manifestPath"].stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def _select_mobile_manifest(
+    candidates: list[dict[str, Any]], case_id: str, run_logs: dict[str, set[str]]
+) -> dict[str, Any]:
+    """在候选清单里挑本轮那一份：优先绑定本轮 run 的，再按 mtime 取最新。"""
+    allowed = run_logs.get(case_id) or set()
+    if allowed:
+        bound = [m for m in candidates if _log_file_name(m.get("runLog")) in allowed]
+        if bound:
+            return max(bound, key=_manifest_mtime)
+    return max(candidates, key=_manifest_mtime)
+
+
+def _mobile_run_binding_findings(
+    manifest: dict[str, Any],
+    task_id: str,
+    case_id: str,
+    run_logs: dict[str, set[str]],
+) -> list[dict[str, Any]]:
+    """证据必须绑定到本轮执行，否则历史 manifest 可以冒充这一次的通过。"""
+    allowed = run_logs.get(case_id) or set()
+    if not allowed:
+        # 没有本轮执行记录时不下判断：那种情况由 task-without-run-evidence 负责。
+        return []
+    declared = _log_file_name(manifest.get("runLog"))
+    if declared and declared in allowed:
         return []
     return [{
-        "type": "mobile-assertion-without-evidence",
+        "type": "mobile-evidence-run-unbound",
         "severity": "fail",
         "taskId": task_id,
         "sourceCaseId": case_id,
-        "assertions": missing[:10],
-        "message": f"{len(missing)} 条 oracle 断言没有 evidenceRefs 映射",
+        "manifest": str(manifest.get("_manifestPath")),
+        "runLog": declared,
+        "expectedRunLogs": sorted(allowed)[:5],
+        "message": (
+            "证据清单没有绑定到本轮执行（manifest.runLog 缺失或不在 latest-run.json 的日志里）；"
+            "历史证据不能冒充这一次通过"
+        ),
     }]
 
 
@@ -1702,12 +1890,17 @@ def _validate_mobile_manifest(manifest: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def assert_mobile_evidence_data(
-    spec_tasks_data: dict[str, Any], repo: Path
+    spec_tasks_data: dict[str, Any],
+    repo: Path,
+    latest_run_data: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """移动端证据门禁：passed 的移动端 task 必须有三类证据的清单与文件。
 
     只有 passed 的 task 才要求证据。blocked / failed / not-run 由各自的语义
     （blocker 证据、失败日志）负责，不能在这里重复判。
+
+    给了 latest_run_data 时额外要求证据绑定本轮执行（manifest.runLog），
+    否则历史目录里的截图与元素树就能冒充这一次的通过。
     """
     tasks = spec_tasks_data.get("tasks") if isinstance(spec_tasks_data, dict) else None
     if not isinstance(tasks, list):
@@ -1759,13 +1952,15 @@ def assert_mobile_evidence_data(
         if normalize_task_status(task.get("executionStatus")) == "passed"
     ]
     scanned_manifests: set[str] = set()
+    # 每个 task 只取最新一份清单：重跑会留下多份 manifest，累加全部会把
+    # 「累计耗时」和「证据清单数」放大成重跑开销，而不是本轮实际成本。
+    matched_manifests: dict[str, dict[str, Any]] = {}
+    run_logs = _mobile_run_logs(latest_run_data)
     for task in passed_tasks:
-        # 断言 -> 证据的映射：结论必须说清是哪类证据支撑的。
-        findings.extend(_validate_mobile_evidence_refs(task))
         case_id = str(task.get("sourceCaseId") or "").strip().upper()
         task_id = str(task.get("id") or "").strip()
-        matched = by_task.get(task_id) or (by_case.get(case_id) if case_id else [])
-        if not matched:
+        candidates = by_task.get(task_id) or (by_case.get(case_id) if case_id else [])
+        if not candidates:
             findings.append({
                 "type": "mobile-evidence-manifest-missing",
                 "severity": "fail",
@@ -1777,20 +1972,30 @@ def assert_mobile_evidence_data(
                 ),
             })
             continue
-        for manifest in matched:
-            manifest_key = str(manifest.get("_manifestPath"))
-            if manifest_key in scanned_manifests:
-                continue
+        latest = _select_mobile_manifest(candidates, case_id, run_logs)
+        matched_manifests[task_id or case_id] = latest
+        # 断言 -> 证据的映射：结论必须说清是哪类证据支撑的，且那类证据真的采到了。
+        findings.extend(_validate_mobile_evidence_refs(task, latest))
+        findings.extend(_mobile_run_binding_findings(latest, task_id, case_id, run_logs))
+        manifest_key = str(latest.get("_manifestPath"))
+        if manifest_key not in scanned_manifests:
             scanned_manifests.add(manifest_key)
             # 证据存在不等于结论正确：日志里有崩溃却标 passed，直接判失败。
-            findings.extend(_scan_mobile_log_crashes(manifest))
+            findings.extend(_scan_mobile_log_crashes(latest))
 
+    summary_manifests = list(matched_manifests.values())
     durations = [
-        m.get("durationMs") for m in manifests
+        m.get("durationMs") for m in summary_manifests
         if isinstance(m.get("durationMs"), (int, float))
         and not isinstance(m.get("durationMs"), bool)
     ]
     status = "failed" if any(f.get("severity") == "fail" for f in findings) else "passed"
+    run_bound = sum(
+        1 for m in summary_manifests
+        if _log_file_name(m.get("runLog")) in (
+            run_logs.get(str(m.get("caseId") or "").strip().upper()) or set()
+        )
+    )
     return {
         "version": "1.0",
         "generatedAt": utc_now(),
@@ -1799,11 +2004,14 @@ def assert_mobile_evidence_data(
             "mobileTasks": len(mobile_tasks),
             "passedMobileTasks": len(passed_tasks),
             "manifests": len(manifests),
+            "matchedManifests": len(summary_manifests),
+            "runBoundManifests": run_bound,
+            "runLogsExpected": len(run_logs),
             "locatorTree": sum(
-                1 for m in manifests if str(m.get("locator") or "").lower() == "tree"
+                1 for m in summary_manifests if str(m.get("locator") or "").lower() == "tree"
             ),
             "locatorScreenshot": sum(
-                1 for m in manifests if str(m.get("locator") or "").lower() == "screenshot"
+                1 for m in summary_manifests if str(m.get("locator") or "").lower() == "screenshot"
             ),
             "totalDurationMs": int(sum(durations)),
             "maxDurationMs": int(max(durations)) if durations else 0,
@@ -2036,6 +2244,84 @@ def _adb_manual_steps(repo: Path) -> list[str]:
     ]
 
 
+def _mobile_cli_info(timeout: int = 15, repo: Path | None = None) -> dict[str, Any]:
+    """检测 mobilecli（mobile-mcp ≥1.0.8 的设备发现依赖它）。
+
+    两个来源都算可用：
+      1. PATH 上的 mobilecli（mobile-mcp / 独立安装）；
+      2. 项目内 `node_modules` 里的 mobilewright —— 它自带 per-platform mobilecli 二进制，
+         不需要用户再装一次。
+    找不到不算失败：脚本驱动（mobile_adb.py）不需要它，只有 agent 直驱才必须先修好。
+    """
+    path = shutil.which("mobilecli")
+    info: dict[str, Any] = {"available": bool(path), "path": path or "", "daemon": "", "bundled": False}
+    if not path and repo is not None:
+        local_bin = repo / "node_modules" / ".bin" / ("mobilecli.cmd" if os.name == "nt" else "mobilecli")
+        if local_bin.exists():
+            path = str(local_bin)
+            info.update(available=True, path=path)
+        elif (repo / "node_modules" / "mobilewright").exists():
+            # mobilewright 把 mobilecli 作为依赖安装；doctor 只需确认它随包可用。
+            info.update(available=True, path=str(repo / "node_modules" / "mobilewright"), bundled=True)
+    if not path or info["bundled"]:
+        return info
+    result = run_cmd([path, "daemon", "status"], Path(tempfile.gettempdir()), timeout=timeout)
+    info["daemon"] = ((result.get("stdout") or "") + (result.get("stderr") or "")).strip()[:400]
+    return info
+
+
+def _node_supports_mobilewright() -> tuple[bool, str]:
+    """Mobilewright 要求 Node ≥ 22.12。返回 (是否满足, 版本号)。"""
+    try:
+        result = subprocess.run(
+            ["node", "--version"], capture_output=True, encoding="utf-8",
+            errors="replace", timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False, "not found"
+    raw = (result.stdout or "").strip().lstrip("v")
+    match = re.match(r"(\d+)\.(\d+)", raw)
+    if not match:
+        return False, raw or "unknown"
+    major, minor = int(match.group(1)), int(match.group(2))
+    return (major, minor) >= (22, 12), raw
+
+
+def _scaffold_mobilewright_config(
+    repo: Path, bundle_id: str, device_id: str = "", force: bool = False,
+) -> Path | None:
+    """写入最小可用的 mobilewright.config.ts（已存在且不 force 时跳过）。"""
+    path = repo / "mobilewright.config.ts"
+    if path.exists() and not force:
+        return None
+    device_line = (
+        f"        deviceId: process.env.ANDROID_SERIAL || '{device_id}',\n"
+        if device_id else "        // deviceId: process.env.ANDROID_SERIAL || '<serial>',\n"
+    )
+    content = f"""import {{ defineConfig }} from 'mobilewright';
+
+export default defineConfig({{
+  testDir: './tests/e2e-mobile',
+  timeout: 120_000,
+  retries: 1,
+  workers: 1,
+  viewTree: 'on-failure',
+  reporter: 'list',
+  projects: [
+    {{
+      name: 'android',
+      use: {{
+        platform: 'android',
+        bundleId: '{bundle_id}',
+{device_line}      }},
+    }},
+  ],
+}});
+"""
+    path.write_text(content, encoding="utf-8")
+    return path
+
+
 def install_mobile_e2e_in_repo(
     repo: Path,
     *,
@@ -2045,6 +2331,8 @@ def install_mobile_e2e_in_repo(
     with_mobilewright: bool = False,
     add_to_path: bool = False,
     with_ios: bool = False,
+    bundle_id: str = "",
+    device_id: str = "",
 ) -> dict[str, Any]:
     """准备移动端 E2E 的工具链（幂等）。
 
@@ -2097,19 +2385,85 @@ def install_mobile_e2e_in_repo(
                 "result": result,
             })
 
+    # mobilecli 与真机发现：装完 adb 后立刻验证「找得到设备」，而不是让使用者
+    # 到 agent 里才发现 mobile-mcp 静默返回空列表。
+    mobilecli = _mobile_cli_info(repo=repo)
+    if dry_run:
+        steps.append({"step": "mobilecli", "status": "dry-run",
+                      "command": "mobilecli daemon status"})
+    elif mobilecli["available"]:
+        steps.append({"step": "mobilecli", "status": "skipped",
+                      "reason": "mobilecli 已可用", "detail": mobilecli["path"]})
+    else:
+        steps.append({
+            "step": "mobilecli",
+            "status": "manual",
+            "reason": "未找到 mobilecli（mobile-mcp ≥1.0.8 设备发现依赖它）；"
+                      "脚本驱动可不装，agent 直驱需先在 PATH 上提供",
+        })
+
+    device_info = _detect_adb_devices(repo) if not ios_only else {
+        "available": False, "authorized": [], "unauthorized": [], "devices": [],
+    }
+    if ios_only:
+        steps.append({"step": "android-devices", "status": "skipped",
+                      "reason": "项目只有 iOS task，跳过 Android 设备枚举"})
+    elif device_info["authorized"]:
+        steps.append({"step": "android-devices", "status": "passed",
+                      "detail": f"{len(device_info['authorized'])} 台已授权："
+                                + ", ".join(device_info["authorized"])})
+    elif device_info["unauthorized"]:
+        steps.append({"step": "android-devices", "status": "manual",
+                      "reason": "设备未授权：" + ", ".join(device_info["unauthorized"])
+                                + "；在手机上点「允许 USB 调试」"})
+    elif device_info["available"]:
+        steps.append({"step": "android-devices", "status": "manual",
+                      "reason": "adb 可用但未发现设备；连接真机或启动模拟器"})
+    else:
+        steps.append({"step": "android-devices", "status": "manual",
+                      "reason": "adb 不可用，无法枚举设备"})
+
     if with_mobilewright:
-        npm = shutil.which("npm") or "npm"
-        cmd = [npm, "install", "--save-dev", "@mobilewright/test"]
-        if dry_run:
-            steps.append({"step": "mobilewright", "status": "dry-run", "command": " ".join(cmd)})
-        else:
-            result = run_cmd(cmd, repo, timeout=timeout)
+        node_ok, node_version = _node_supports_mobilewright()
+        if not node_ok:
             steps.append({
                 "step": "mobilewright",
-                "status": "passed" if result["exitCode"] == 0 else "failed",
-                "command": " ".join(cmd),
-                "result": result,
+                "status": "failed",
+                "reason": f"Node.js {node_version} 低于 22.12；Mobilewright 无法运行",
             })
+        else:
+            npm = shutil.which("npm") or "npm"
+            cmd = [npm, "install", "--save-dev", "mobilewright", "@mobilewright/test"]
+            if dry_run:
+                steps.append({"step": "mobilewright", "status": "dry-run",
+                              "command": " ".join(cmd)})
+            else:
+                result = run_cmd(cmd, repo, timeout=timeout)
+                steps.append({
+                    "step": "mobilewright",
+                    "status": "passed" if result["exitCode"] == 0 else "failed",
+                    "command": " ".join(cmd),
+                    "result": result,
+                })
+                if result["exitCode"] == 0:
+                    config_path = _scaffold_mobilewright_config(
+                        repo, bundle_id or "<bundle-id>", device_id,
+                    )
+                    steps.append({
+                        "step": "mobilewright-config",
+                        "status": "passed" if config_path else "skipped",
+                        "path": str(config_path) if config_path else str(repo / "mobilewright.config.ts"),
+                        "reason": "" if config_path else "已存在，未覆盖",
+                    })
+                    devices = run_cmd(
+                        [find_npx() or "npx", "mobilewright", "devices"],
+                        repo, timeout=120,
+                    )
+                    steps.append({
+                        "step": "mobilewright-devices",
+                        "status": "passed" if devices["exitCode"] == 0 else "manual",
+                        "detail": (devices.get("stdout") or devices.get("stderr") or "")[:400],
+                    })
 
     found_adb = _find_adb()
     managed_adb = platform_tools_dir() / ("adb.exe" if os.name == "nt" else "adb")
@@ -2168,6 +2522,8 @@ def install_mobile_e2e(args: argparse.Namespace) -> None:
         with_mobilewright=bool(getattr(args, "with_mobilewright", False)),
         add_to_path=bool(getattr(args, "add_to_path", False)),
         with_ios=bool(getattr(args, "with_ios", False)),
+        bundle_id=getattr(args, "bundle_id", "") or "",
+        device_id=getattr(args, "device", "") or "",
     )
     print(f"移动端 E2E 工具链：{install['status']}")
     for step in install["steps"]:
@@ -3220,13 +3576,38 @@ def extract_playwright_config_hints(text: str) -> dict[str, Any]:
     return hints
 
 
+def _non_git_scope_context(repo: Path, scope: str, module: str | None) -> dict[str, Any]:
+    """无 git 工作区的最小 scope：不编造 diff，只记录边界和可选模块检索。"""
+    data: dict[str, Any] = {
+        "mode": "non-git",
+        "requestedMode": scope,
+        "description": "工作区没有 .git；按模块名或人工声明的范围收集，diff 相关字段为空。",
+        "files": [],
+    }
+    if module:
+        data["module"] = module
+        try:
+            data["matches"] = search_module_matches(repo, module)
+        except QaAgentError as exc:
+            data["moduleSearchError"] = str(exc)
+    return data
+
+
 def collect_context(args: argparse.Namespace) -> None:
     repo = Path(args.repo).resolve()
-    if not (repo / ".git").exists():
-        raise QaAgentError(f"Not a git repository: {repo}")
+    is_git = (repo / ".git").exists()
+    if not is_git and not getattr(args, "allow_non_git", False):
+        raise QaAgentError(
+            f"Not a git repository: {repo}\n"
+            "  如果是无源码/黑盒验收（如移动端真机），加 --allow-non-git 生成最小上下文；"
+            "git 相关字段会留空并标注 scope.mode=non-git。"
+        )
     output = Path(args.output).resolve()
     base = args.base or "main"
-    scope = build_scope_context(repo, args.scope, base, args.module, args.commit)
+    if is_git:
+        scope = build_scope_context(repo, args.scope, base, args.module, args.commit)
+    else:
+        scope = _non_git_scope_context(repo, args.scope, args.module)
     docs = find_files(
         repo,
         {"AGENTS.md", "CLAUDE.md", "README.md", "质量保证Agent.md"},
@@ -3240,16 +3621,24 @@ def collect_context(args: argparse.Namespace) -> None:
                 "content": read_text(doc, args.doc_limit),
             }
         )
+    if is_git:
+        current_branch = git_output(repo, ["branch", "--show-current"]).strip()
+        git_status = git_output(repo, ["status", "--short", "--branch"])
+        diff_stat = git_output(repo, ["diff", "--stat", base + "...HEAD"])
+        diff_names = git_output(repo, ["diff", "--name-only", base + "...HEAD"]).splitlines()
+    else:
+        current_branch, git_status, diff_stat, diff_names = "", "", "", []
     context = {
         "version": "1.0",
         "collectedAt": utc_now(),
         "repo": str(repo),
+        "gitAvailable": is_git,
         "baseBranch": base,
         "scope": scope,
-        "currentBranch": git_output(repo, ["branch", "--show-current"]).strip(),
-        "gitStatus": git_output(repo, ["status", "--short", "--branch"]),
-        "gitDiffStat": git_output(repo, ["diff", "--stat", base + "...HEAD"]),
-        "gitDiffNameOnly": git_output(repo, ["diff", "--name-only", base + "...HEAD"]).splitlines(),
+        "currentBranch": current_branch,
+        "gitStatus": git_status,
+        "gitDiffStat": diff_stat,
+        "gitDiffNameOnly": diff_names,
         "stack": detect_stack(repo),
         "testProfile": detect_project_test_profile(repo),
         "playwright": detect_playwright_assets(repo),
@@ -3961,17 +4350,70 @@ def parse_ratio(value: str | None) -> dict[str, float]:
     return {key: value / total for key, value in ratio.items()}
 
 
-def spec_task_minimum(priority: str, override: str | None = None) -> int:
-    minimums = dict(DEFAULT_SPEC_TASK_MIN_BY_PRIORITY)
+def _parse_min_specs_override(override: str | dict[str, Any] | None) -> dict[str, int]:
+    """把 `P0=8,P1=5` 或 {P0: 8} 统一解析成映射；非法项抛错（保持既有契约）。"""
+    parsed: dict[str, int] = {}
+    if isinstance(override, dict):
+        for key, value in override.items():
+            key_upper = str(key).strip().upper()
+            if key_upper not in CASE_PRIORITIES:
+                raise QaAgentError(f"Invalid min-specs item: {key}")
+            try:
+                parsed[key_upper] = int(value)
+            except (TypeError, ValueError) as exc:
+                raise QaAgentError(f"Invalid min-specs value: {key}={value}") from exc
+        return parsed
     if override:
-        for part in override.split(","):
+        for part in str(override).split(","):
             if not part.strip():
                 continue
             key, _, raw = part.partition("=")
             key = key.strip().upper()
             if key not in CASE_PRIORITIES or not raw.strip():
                 raise QaAgentError(f"Invalid min-specs item: {part}")
-            minimums[key] = int(raw)
+            parsed[key] = int(raw)
+    return parsed
+
+
+def effective_min_specs(
+    override: str | dict[str, Any] | None = None,
+    artifact_minimums: Any = None,
+    profile: str = "",
+) -> dict[str, int]:
+    """解析每个优先级的最小 task 数，优先级从高到低：
+
+    显式 --min-specs-by-priority > 产物根级 minSpecsByPriority > generationProfile
+    默认（mobile-e2e 每级 1）> 全局默认（P0=8/P1=5）。
+
+    中间那两层原先只在 coverage-balance 里生效，assert-completion 不读——于是
+    `generate-spec-tasks --profile mobile-e2e` 生成的产物（每用例 1 条）拿去跑
+    assert-completion 会全部判失败，同一份数据换个人重跑结论就翻转。
+    """
+    if str(profile or "").strip().lower() == "mobile-e2e":
+        minimums = {"P0": 1, "P1": 1, "P2": 1, "P3": 1}
+    else:
+        minimums = dict(DEFAULT_SPEC_TASK_MIN_BY_PRIORITY)
+    if isinstance(artifact_minimums, dict):
+        for key, value in artifact_minimums.items():
+            key_upper = str(key).strip().upper()
+            if key_upper not in CASE_PRIORITIES:
+                continue
+            try:
+                minimums[key_upper] = max(1, int(value))
+            except (TypeError, ValueError):
+                continue
+    minimums.update(_parse_min_specs_override(override))
+    return minimums
+
+
+def spec_task_minimum(
+    priority: str,
+    override: str | dict[str, Any] | None = None,
+    *,
+    artifact_minimums: Any = None,
+    profile: str = "",
+) -> int:
+    minimums = effective_min_specs(override, artifact_minimums, profile)
     return minimums.get(priority, 2)
 
 
@@ -4224,17 +4666,41 @@ def method_name_for_task_id(task_id: str) -> str:
     return name
 
 
-def build_spec_task(case: dict[str, Any], layer: str, focus: dict[str, str], index: int, repo: Path | None = None) -> dict[str, Any]:
+def build_spec_task(
+    case: dict[str, Any],
+    layer: str,
+    focus: dict[str, str],
+    index: int,
+    repo: Path | None = None,
+    generation_profile: str = "development",
+) -> dict[str, Any]:
     case_id = str(case.get("id", f"CASE-{index:03d}"))
     layer_code = {"unit": "UNIT", "integration": "INT", "api": "API", "e2e": "E2E"}[layer]
-    project = _resolve_task_project(case, layer, repo)
-    target_project = _project_display_name(project, repo)
-    project_kind = getattr(project, "kind", "maven")
-    target_file = target_file_for_task(case, layer, target_project, index, project_kind)
-    command = command_for_spec_task(layer, target_project, target_file, project_kind)
+    task_id = f"SPEC-{case_id}-{layer_code}-{index:03d}"
+    if generation_profile == "mobile-e2e":
+        # 无源码移动端：仓库里没有 pom.xml/package.json，跳过项目解析。
+        # 回归引擎固定为 Mobilewright：targetFile 指向 .spec.ts，命令走 run-mobile-e2e。
+        target_project = ""
+        project_kind = "mobile"
+        module_slug = spec_slug(str(case.get("module") or case.get("title") or case_id))
+        target_file = f"tests/e2e-mobile/{module_slug}/{case_id.lower()}.spec.ts"
+        data = case.get("data") or {}
+        bundle_id = str(data.get("appPackage", "")) if isinstance(data, dict) else ""
+        command = (
+            f'python "$QA_AGENT_DIR/scripts/qa_agent.py" run-mobile-e2e --repo . '
+            f'--spec "{target_file}" --case-id {case_id} --task-id {task_id}'
+        )
+        if bundle_id:
+            command += f" --app-package {bundle_id}"
+    else:
+        project = _resolve_task_project(case, layer, repo)
+        target_project = _project_display_name(project, repo)
+        project_kind = getattr(project, "kind", "maven")
+        target_file = target_file_for_task(case, layer, target_project, index, project_kind)
+        command = command_for_spec_task(layer, target_project, target_file, project_kind)
     title = f"{case.get('title', case_id)} - {focus['title']}"
     task: dict[str, Any] = {
-        "id": f"SPEC-{case_id}-{layer_code}-{index:03d}",
+        "id": task_id,
         "sourceCaseId": case_id,
         "priority": case.get("priority", "P2"),
         "layer": layer,
@@ -4243,7 +4709,7 @@ def build_spec_task(case: dict[str, Any], layer: str, focus: dict[str, str], ind
         "targetFile": target_file,
         "testName": title,
         # 可执行的方法名（契约字段）：执行阶段按它核对测试是否真的实现了
-        "methodName": method_name_for_task_id(f"SPEC-{case_id}-{layer_code}-{index:03d}"),
+        "methodName": method_name_for_task_id(task_id),
         "businessActor": case.get("businessActor", ""),
         "operationPath": case.get("operationPath", " -> ".join(map(str, case.get("steps", [])))),
         "assertions": _build_task_assertions(case, focus),
@@ -4261,6 +4727,19 @@ def build_spec_task(case: dict[str, Any], layer: str, focus: dict[str, str], ind
     # generic 项目：脚本不硬造路径/命令，标记要求上游（AI）在实现阶段填入 command/targetFile
     if project_kind == "generic":
         task["needsManualCommand"] = True
+    if generation_profile == "mobile-e2e":
+        task["platform"] = "android-real"
+        if bundle_id:
+            task["appPackage"] = bundle_id
+        else:
+            # 包名未知时无法自动抓证据；实现阶段必须补 --app-package。
+            task["needsManualCommand"] = True
+            task.setdefault("notes", []).append(
+                "mobile-e2e profile: 在 command 补 --app-package <包名>，否则执行后不会写证据 manifest"
+            )
+        task.setdefault("notes", []).append(
+            "回归引擎 Mobilewright：npx mobilewright test <spec> --project=<project>"
+        )
     return task
 
 
@@ -4292,7 +4771,7 @@ def generate_spec_tasks_data(
         case_tasks: list[dict[str, Any]] = []
         for idx, layer in enumerate(layers, start=1):
             focus = focuses[(idx - 1) % len(focuses)]
-            task = build_spec_task(case, layer, focus, idx, repo)
+            task = build_spec_task(case, layer, focus, idx, repo, generation_profile)
             tasks.append(task)
             case_tasks.append({"id": task["id"], "layer": layer, "focus": task["focus"]})
         per_case[str(case.get("id", ""))] = {
@@ -4329,13 +4808,20 @@ def generate_spec_tasks_data(
 def generate_spec_tasks(args: argparse.Namespace) -> None:
     cases_path = Path(args.cases).resolve()
     repo = Path(args.repo).resolve() if args.repo else None
-    ratio = parse_ratio(args.ratio)
+    profile = getattr(args, "profile", "development")
+    default_ratio = "unit=0.60,integration=0.20,api=0.15,e2e=0.05"
+    default_min = "P0=8,P1=5,P2=3,P3=1"
+    if profile == "mobile-e2e":
+        default_ratio = "unit=0,integration=0,api=0,e2e=1"
+        default_min = "P0=1,P1=1,P2=1,P3=1"
+    ratio = parse_ratio(args.ratio or default_ratio)
     data = generate_spec_tasks_data(
         read_json(cases_path),
         repo=repo,
         ratio=ratio,
-        min_specs_override=args.min_specs_by_priority,
+        min_specs_override=args.min_specs_by_priority or default_min,
         max_e2e_per_case=args.max_e2e_per_case,
+        generation_profile=profile,
     )
     output = Path(args.output).resolve()
     write_json(output, data)
@@ -4669,8 +5155,153 @@ def _determine_selection_source(module: list[str] | None, candidates_from_git: b
     return "repository-fallback"
 
 
-def analyze_risks_data(repo: Path, context: dict[str, Any] | None = None, existing_index: dict[str, Any] | None = None, module: list[str] | None = None) -> dict[str, Any]:
+# 无源码移动端（黑盒 APK/IPA）的通用风险骨架。
+# 关键词扫描对这种目标无效——没有源码可扫，硬扫仓库只会产出与业务无关的噪音。
+# 这些条目是移动端验收真正会踩的类别，必须由真机证据逐条落地，不代替业务分析。
+MOBILE_SURFACE_RISK_SKELETON = [
+    {
+        "category": "state-transition",
+        "priority": "P0",
+        "risk": "冷启动、重置状态或重新登录后，会话/购物车/表单残留上一轮数据",
+        "impact": "用户看到不属于自己的状态，或重复提交基于脏数据",
+        "requiredAssertions": [
+            "重置 App 状态后重新登录，购物车与表单回到初始值",
+            "杀掉进程再冷启动，登录态与业务态符合预期（保持或明确登出）",
+        ],
+    },
+    {
+        "category": "money-reward-settlement",
+        "priority": "P0",
+        "risk": "结算金额（小计、运费、税费、优惠）不一致，或重复点击提交产生重复订单",
+        "impact": "金额错误或重复扣款/下单，直接的资金与履约风险",
+        "requiredAssertions": [
+            "页面展示的合计等于各项金额之和，且与实际提交金额一致",
+            "重复点击提交只产生一笔订单",
+        ],
+    },
+    {
+        "category": "permission-boundary",
+        "priority": "P1",
+        "risk": "未登录或会话失效时仍能进入受保护页面，或能看到他人数据",
+        "impact": "越权访问与隐私泄露",
+        "requiredAssertions": [
+            "未登录访问受保护页面被拦截并引导登录",
+            "会话失效后受保护操作失败且不写入脏数据",
+        ],
+    },
+    {
+        "category": "negative-path",
+        "priority": "P1",
+        "risk": "必填字段缺失或非法输入时，错误提示不可见/被键盘遮挡，或提交仍然成功",
+        "impact": "用户无法理解失败原因，或错误数据进入后端",
+        "requiredAssertions": [
+            "空表单提交展示全部必填错误且不产生副作用",
+            "非法格式输入被拒绝，提示文案可见",
+        ],
+    },
+    {
+        "category": "data-consistency",
+        "priority": "P2",
+        "risk": "列表/详情/历史页之间的数据不同步（下单后购物车未清空、历史缺失）",
+        "impact": "用户看到自相矛盾的状态，业务记录不可追溯",
+        "requiredAssertions": [
+            "下单成功后购物车与订单列表状态一致",
+            "详情页与列表页展示同一实体的关键字段一致",
+        ],
+    },
+]
+
+
+def _mobile_surface_risk_data(
+    repo: Path,
+    context: dict[str, Any],
+    existing_index: dict[str, Any],
+    module: list[str] | None,
+) -> dict[str, Any]:
+    existing_text = json.dumps(existing_index, ensure_ascii=False).lower() if existing_index else ""
+    risks: list[dict[str, Any]] = []
+    counters: dict[str, int] = {}
+    for item in MOBILE_SURFACE_RISK_SKELETON:
+        priority = item["priority"]
+        counters[priority] = counters.get(priority, 0) + 1
+        category = item["category"]
+        risks.append(
+            {
+                "id": f"RISK-{priority}-{counters[priority]:03d}",
+                "priority": priority,
+                "category": category,
+                "businessPath": "移动端 UI 流程（无源码，无法映射到代码路径）",
+                "risk": item["risk"],
+                "impact": item["impact"],
+                "affectedFiles": [],
+                "signals": [],
+                "requiredAssertions": list(item["requiredAssertions"]),
+                "suggestedTestLayers": ["e2e"],
+                "coverageStatus": "covered" if category in existing_text else "missing",
+                "requiresE2E": True,
+                "surface": "mobile",
+            }
+        )
+    coverage_gaps = [
+        {
+            "riskId": risk["id"],
+            "priority": risk["priority"],
+            "category": risk["category"],
+            "gap": "缺少现有用例/真机证据覆盖该风险",
+            "requiredAssertions": risk["requiredAssertions"],
+        }
+        for risk in risks
+        if risk.get("coverageStatus") == "missing"
+    ]
+    required_oracles = {
+        "ui": ["关键页面元素、按钮状态、提示文案与跳转符合业务预期"],
+        "api": [],
+        "db": [],
+        "sideEffects": [],
+        "negativeAssertions": ["非法输入、越权、重复提交不会写入脏数据"],
+    }
+    by_priority: dict[str, int] = {}
+    by_category: dict[str, int] = {}
+    for risk in risks:
+        by_priority[risk["priority"]] = by_priority.get(risk["priority"], 0) + 1
+        by_category[risk["category"]] = by_category.get(risk["category"], 0) + 1
+    return {
+        "version": "1.0",
+        "generatedAt": utc_now(),
+        "riskSkeleton": "mobile-surface",
+        "summary": {
+            "total": len(risks),
+            "byPriority": by_priority,
+            "byCategory": by_category,
+            "inspectedFiles": 0,
+            "note": "无源码边界：这是移动端通用风险骨架，需结合真机证据逐条落地，不替代业务风险分析",
+        },
+        "scope": {
+            "repo": str(repo),
+            "surface": "mobile",
+            "selectionSource": "surface-mobile",
+            "requestedModules": list(module) if module else [],
+            "contextRef": context.get("scope") or "",
+            "existingIndexSummary": existing_index.get("summary", {}),
+        },
+        "inspectedFiles": [],
+        "risks": risks,
+        "coverageGaps": coverage_gaps,
+        "requiredOracles": required_oracles,
+    }
+
+
+def analyze_risks_data(
+    repo: Path,
+    context: dict[str, Any] | None = None,
+    existing_index: dict[str, Any] | None = None,
+    module: list[str] | None = None,
+    surface: str = "code",
+) -> dict[str, Any]:
     context = context or {}
+    existing_index = existing_index or {}
+    if surface == "mobile":
+        return _mobile_surface_risk_data(repo, context, existing_index, module)
     existing_index = existing_index or {}
     # Detect source before delegating to candidate helper
     git_files: list[str] = []
@@ -4783,7 +5414,10 @@ def analyze_risks(args: argparse.Namespace) -> None:
     context = _read_optional_json(args.context)
     existing_index = _read_optional_json(args.existing_index)
     module = _parse_module_list(args.module) if getattr(args, "module", None) else None
-    result = analyze_risks_data(repo, context=context, existing_index=existing_index, module=module)
+    surface = getattr(args, "surface", "code")
+    result = analyze_risks_data(
+        repo, context=context, existing_index=existing_index, module=module, surface=surface,
+    )
     output = Path(args.output).resolve()
     write_json(output, result)
     update_manifest(repo, stage="risk-analyzer",
@@ -4798,19 +5432,27 @@ def _parse_module_list(raw: str | None) -> list[str] | None:
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
+MOBILE_COVERAGE_RATIO = {"unit": 0, "integration": 0, "api": 0, "e2e": 1}
+MOBILE_COVERAGE_MIN_BY_PRIORITY = {"P0": 1, "P1": 1, "P2": 1, "P3": 1}
+
+
 def coverage_balance_data(
     spec_tasks_data: dict[str, Any],
     *,
     target_ratio: dict[str, float] | None = None,
     tolerance: float = 0.15,
     min_specs_override: str | None = None,
+    profile: str = "development",
 ) -> dict[str, Any]:
     tasks = spec_tasks_data.get("tasks", [])
     if not isinstance(tasks, list):
         raise QaAgentError("spec tasks root.tasks must be an array")
-    target_ratio = target_ratio or spec_tasks_data.get("targetRatio") or dict(DEFAULT_SPEC_TASK_TARGET_RATIO)
-    # 解析每个优先级的最小 task 数：显式 override > 产物 minSpecsByPriority > 默认
-    effective_minimums = dict(DEFAULT_SPEC_TASK_MIN_BY_PRIORITY)
+    mobile_profile = profile == "mobile"
+    default_ratio = MOBILE_COVERAGE_RATIO if mobile_profile else DEFAULT_SPEC_TASK_TARGET_RATIO
+    target_ratio = target_ratio or spec_tasks_data.get("targetRatio") or dict(default_ratio)
+    # 解析每个优先级的最小 task 数：显式 override > 产物 minSpecsByPriority > profile 默认 > 全局默认
+    default_minimums = MOBILE_COVERAGE_MIN_BY_PRIORITY if mobile_profile else DEFAULT_SPEC_TASK_MIN_BY_PRIORITY
+    effective_minimums = dict(default_minimums)
     if min_specs_override:
         for part in min_specs_override.split(","):
             if not part.strip():
@@ -4870,7 +5512,9 @@ def coverage_balance_data(
                     "severity": "fail" if priority in {"P0", "P1"} else "warn",
                 }
             )
-    if counts.get("e2e", 0) > counts.get("api", 0) + counts.get("integration", 0):
+    # 无源码移动端没有 unit/integration/api 可写，e2e 天然占 100%；
+    # 「e2e 不应重于 api+integration」这条只适用于有源码的金字塔。
+    if not mobile_profile and counts.get("e2e", 0) > counts.get("api", 0) + counts.get("integration", 0):
         findings.append(
             {
                 "type": "e2e-too-heavy",
@@ -4907,6 +5551,7 @@ def coverage_balance(args: argparse.Namespace) -> None:
         target_ratio=parse_ratio(args.ratio) if args.ratio else None,
         tolerance=args.tolerance,
         min_specs_override=args.min_specs_by_priority,
+        profile=getattr(args, "profile", "development"),
     )
     if args.output:
         write_json(Path(args.output).resolve(), result)
@@ -5041,8 +5686,15 @@ def assert_script_implementation_data(spec_tasks_data: dict[str, Any], repo: Pat
                 "findings": [{"type": "invalid-tasks", "severity": "fail", "message": "tasks 必须是数组"}]}
     by_file: dict[str, list[dict[str, Any]]] = {}
     agent_driven_count = 0
+    blocked_count = 0
     for t in tasks:
         if not isinstance(t, dict):
+            continue
+        # 已明确 blocked 的 task 不需要脚本文件；否则「没有订单历史入口」这类
+        # 产品缺口会永远卡在实现门禁上——那不是实现缺失，是功能不可测。
+        if (normalize_task_status(t.get("implementationStatus")) == "blocked"
+                or normalize_task_status(t.get("executionStatus")) in {"blocked", "skipped", "deferred"}):
+            blocked_count += 1
             continue
         tf = str(t.get("targetFile", "") or "").strip()
         if not tf:
@@ -5094,7 +5746,7 @@ def assert_script_implementation_data(spec_tasks_data: dict[str, Any], repo: Pat
         "generatedAt": utc_now(),
         "status": "failed" if findings else "passed",
         "summary": {"files": len(by_file), "findings": len(findings),
-                    "agentDrivenTasks": agent_driven_count},
+                    "agentDrivenTasks": agent_driven_count, "blockedTasks": blocked_count},
         "findings": findings,
     }
 
@@ -5112,6 +5764,95 @@ def assert_script_implementation(args: argparse.Namespace) -> None:
         raise SystemExit(1)
 
 
+def _spec_tasks_metadata_findings(
+    spec_tasks_data: dict[str, Any], tasks: list[Any]
+) -> list[dict[str, Any]]:
+    """检查 spec-tasks 自述的 summary / perCase 与 tasks 是否一致。
+
+    生成器写完产物之后，补一条 task 而忘了更新 summary.total，或者删掉一条
+    perCase 还留着旧账——下游按 summary 算覆盖率就会算错，而且错得很安静。
+    """
+    if not isinstance(spec_tasks_data, dict):
+        return []
+    findings: list[dict[str, Any]] = []
+    valid_tasks = [task for task in tasks if isinstance(task, dict)]
+
+    def _count_by(key: str) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for task in valid_tasks:
+            value = str(task.get(key, "") or "")
+            if value:
+                counts[value] = counts.get(value, 0) + 1
+        return counts
+
+    summary = spec_tasks_data.get("summary")
+    if isinstance(summary, dict):
+        declared_total = summary.get("total")
+        if (
+            isinstance(declared_total, int)
+            and not isinstance(declared_total, bool)
+            and declared_total != len(valid_tasks)
+        ):
+            findings.append({
+                "type": "spec-tasks-metadata-mismatch",
+                "severity": "fail",
+                "field": "summary.total",
+                "declared": declared_total,
+                "actual": len(valid_tasks),
+                "message": (
+                    f"summary.total={declared_total}，但 tasks 实际有 {len(valid_tasks)} 条；"
+                    "产物生成后被改动过，先修正 summary 再判覆盖"
+                ),
+            })
+        by_layer = summary.get("byLayer")
+        if isinstance(by_layer, dict):
+            actual_layers = _count_by("layer")
+            drift = {
+                str(layer): {"declared": value, "actual": actual_layers.get(str(layer), 0)}
+                for layer, value in by_layer.items()
+                if isinstance(value, int) and not isinstance(value, bool)
+                and value != actual_layers.get(str(layer), 0)
+            }
+            if drift:
+                findings.append({
+                    "type": "spec-tasks-metadata-mismatch",
+                    "severity": "fail",
+                    "field": "summary.byLayer",
+                    "drift": drift,
+                    "message": "summary.byLayer 与 tasks 的 layer 分布对不上",
+                })
+    per_case = spec_tasks_data.get("perCase")
+    if isinstance(per_case, dict):
+        actual_counts = _count_by("sourceCaseId")
+        declared_cases = {str(case_id) for case_id in per_case}
+        drift: list[dict[str, Any]] = []
+        for case_id, entry in per_case.items():
+            if not isinstance(entry, dict):
+                continue
+            declared = entry.get("taskCount")
+            actual = actual_counts.get(str(case_id), 0)
+            if (
+                isinstance(declared, int)
+                and not isinstance(declared, bool)
+                and declared != actual
+            ):
+                drift.append({"caseId": str(case_id), "declared": declared, "actual": actual})
+        missing = sorted(case_id for case_id in actual_counts if case_id not in declared_cases)
+        if drift or missing:
+            findings.append({
+                "type": "spec-tasks-metadata-mismatch",
+                "severity": "fail",
+                "field": "perCase",
+                "drift": drift[:20],
+                "missingCases": missing[:20],
+                "message": (
+                    "perCase 与 tasks 对不上："
+                    f"{len(drift)} 条计数不一致，{len(missing)} 条用例有 task 但没登记"
+                ),
+            })
+    return findings
+
+
 def assert_completion_data(
     cases_data: dict[str, Any],
     spec_tasks_data: dict[str, Any],
@@ -5121,7 +5862,7 @@ def assert_completion_data(
     allow_deferred: bool = False,
     allow_skipped: bool = False,
     fail_on_failed: bool = False,
-    min_specs_override: str | None = None,
+    min_specs_override: str | dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     priorities = priorities or {"P0", "P1"}
     errors, normalized_cases = validate_cases_data(cases_data, mutate=True)
@@ -5170,6 +5911,14 @@ def assert_completion_data(
     findings: list[dict[str, Any]] = []
     for error in blocking_case_errors:
         findings.append({"type": "invalid-case-file", "severity": "fail", "message": error})
+    # 产物自己写的 summary / perCase 与 tasks 对不上，说明生成后被改过（补了 task
+    # 没更新 summary，或删了 task 没更新 perCase）。先报出来，别让下游按错的账算。
+    findings.extend(_spec_tasks_metadata_findings(spec_tasks_data, tasks))
+
+    # 最小 task 数：override 没给时沿用产物自己声明的口径（mobile-e2e 生成器写的就是
+    # 每级 1），而不是拿开发档的 8/5 去判一份移动端产物。
+    artifact_minimums = spec_tasks_data.get("minSpecsByPriority")
+    generation_profile = str(spec_tasks_data.get("generationProfile") or "")
 
     confirmed_statuses = {"confirmed", "implemented", "passed", "failed", "blocked", "skipped"}
     for case_id, case in sorted(cases_by_id.items()):
@@ -5202,7 +5951,12 @@ def assert_completion_data(
                 }
             )
             continue
-        minimum = spec_task_minimum(priority, min_specs_override)
+        minimum = spec_task_minimum(
+            priority,
+            min_specs_override,
+            artifact_minimums=artifact_minimums,
+            profile=generation_profile,
+        )
         if len(case_tasks) < minimum:
             findings.append(
                 {
@@ -5560,6 +6314,14 @@ def check_evidence_integrity(
         })
     missing_runs: list[str] = []
     for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        # blocked / skipped / deferred 本来就不会产生执行记录；completion 门禁在
+        # --allow-blocked 等开关下接受它们，证据门禁不能再用「没有 run」二次判死。
+        execution_status = normalize_task_status(task.get("executionStatus"))
+        implementation_status = normalize_task_status(task.get("implementationStatus"))
+        if execution_status in {"blocked", "skipped", "deferred"} or implementation_status == "blocked":
+            continue
         case_id = str(task.get("sourceCaseId", "") or "").upper()
         if case_id and case_id not in run_case_ids:
             missing_runs.append(case_id)
@@ -5570,6 +6332,38 @@ def check_evidence_integrity(
             "caseIds": list(dict.fromkeys(missing_runs))[:20],
             "message": f"{len(set(missing_runs))} 个 spec-task 缺少执行记录",
         })
+    # 结论一致性：run 说 FAIL，task 却写 passed —— 这是「跑失败了但标成通过」，
+    # 比「压根没跑」更危险，因为报告里它和真通过长得一模一样。
+    outcomes = {
+        str(c.get("caseId", "") or "").upper(): str(c.get("finalOutcome", "") or "").upper()
+        for c in run_cases
+        if isinstance(c, dict)
+    }
+    passed_but_failed: list[dict[str, str]] = []
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        if normalize_task_status(task.get("executionStatus")) != "passed":
+            continue
+        case_id = str(task.get("sourceCaseId", "") or "").upper()
+        outcome = outcomes.get(case_id, "")
+        if outcome and outcome in RUN_NOT_PASSED_OUTCOMES:
+            passed_but_failed.append({
+                "taskId": str(task.get("id", "") or ""),
+                "caseId": case_id,
+                "finalOutcome": outcome,
+            })
+    if passed_but_failed:
+        findings.append({
+            "type": "run-task-outcome-mismatch",
+            "severity": "fail",
+            "mismatches": passed_but_failed[:20],
+            "message": (
+                f"{len(passed_but_failed)} 个 spec-task 标为 passed，但其对应 run 的 finalOutcome 不是 PASS"
+                "（执行失败被记成通过）"
+            ),
+        })
+
     scope = code_review_data.get("scope") if code_review_data else None
     if scope is not None and not isinstance(scope, dict):
         findings.append({
@@ -5603,7 +6397,10 @@ def assert_evidence_integrity(args: argparse.Namespace) -> None:
     # 移动端证据契约挂在这个门禁上：readiness 只读这份产物，不合并的话
     # 「少一样证据报告不通过」就只是文档里的一句话。
     repo = Path(getattr(args, "repo", ".") or ".").resolve()
-    result = merge_gate_results(result, assert_mobile_evidence_data(spec_tasks_data, repo))
+    result = merge_gate_results(
+        result,
+        assert_mobile_evidence_data(spec_tasks_data, repo, latest_run_data=latest_run_data),
+    )
     if args.output:
         write_json(Path(args.output).resolve(), result)
     print(f"证据完整性门禁：{result['status']}（用例 {result['summary']['testCasesTotal']} / task {result['summary']['specTasksTotal']} / run {result['summary']['runCasesTotal']} / 未匹配 {result['summary']['unmatchedLogs']}）")
@@ -5620,7 +6417,15 @@ def assert_mobile_evidence(args: argparse.Namespace) -> None:
         if getattr(args, "spec_tasks", None) and Path(args.spec_tasks).exists()
         else {}
     )
-    result = assert_mobile_evidence_data(spec_tasks_data, Path(args.repo).resolve())
+    result = assert_mobile_evidence_data(
+        spec_tasks_data,
+        Path(args.repo).resolve(),
+        latest_run_data=(
+            read_json(Path(args.run).resolve())
+            if getattr(args, "run", None) and Path(args.run).exists()
+            else None
+        ),
+    )
     if args.output:
         write_json(Path(args.output).resolve(), result)
     summary = result["summary"]
@@ -6927,17 +7732,27 @@ def init_project(args: argparse.Namespace) -> None:
         )
     )
     config_path = repo / ".qa-agent" / "config" / "qa-agent.config.yaml"
+    project_profile = getattr(args, "profile", "auto")
+    mobile_only = project_profile == "mobile"
     init_config(
         argparse.Namespace(
             output=str(config_path),
             repo=str(repo),
             agent=normalize_agent_name(getattr(args, "agent", AGENT_CLAUDE)),
+            skip_playwright_agents=mobile_only,
         )
     )
     profile = detect_project_test_profile(repo)
+    if mobile_only:
+        # 无源码黑盒移动端：没有可用的项目测试套件，也不该生成 Playwright/服务骨架
+        profile = {
+            "profileMode": "mobile",
+            "suites": [],
+            "note": "移动端黑盒验收：不生成 Playwright/服务栈骨架；测试由 mobile_adb 驱动脚本执行",
+        }
     profile_path = repo / ".qa-agent" / "profiles" / "project-test-profile.json"
     write_json_if_needed(profile_path, {"version": "1.0", "generatedAt": utc_now(), **profile}, force=force)
-    services = infer_service_examples(repo)
+    services = [] if mobile_only else infer_service_examples(repo)
     services_data = {
         "version": "1.0",
         "_comment": "服务结构定义：URL 值配置在 env（config/env.shared 公有默认 / local/.env 私有覆盖），通过 baseUrlEnv 环境变量读取；local/services.local.json 用于按 id 私有覆盖服务结构（如 dir/startCmd/readySignal），未列出的服务保持本文件的定义。",
@@ -6954,10 +7769,13 @@ def init_project(args: argparse.Namespace) -> None:
     write_text_if_needed(Path(written["localEnv"]), env_example_text([], services), force=False)
     agent = normalize_agent_name(getattr(args, "agent", AGENT_CLAUDE))
     _set_env_key(Path(written["localEnv"]), "QA_AGENT", agent)
-    seed_playwright_templates(repo, force=force)
-    seed_e2e_lib(repo, force=force)
+    if not mobile_only:
+        seed_playwright_templates(repo, force=force)
+        seed_e2e_lib(repo, force=force)
     # 默认装 Playwright 运行时（@playwright/test + config + 浏览器），已就绪则跳过；失败（如无 npm）不阻塞初始化
-    if not getattr(args, "skip_playwright_runtime", False):
+    if mobile_only:
+        print("mobile profile：跳过 Playwright 模板与运行时（移动端只用 adb/mobile_adb）")
+    elif not getattr(args, "skip_playwright_runtime", False):
         try:
             install = install_playwright_runtime_in_repo(
                 repo,
@@ -6976,10 +7794,24 @@ def init_project(args: argparse.Namespace) -> None:
             print(f"跳过 Playwright 运行时安装：{exc}")
     verify_mysql = bool(getattr(args, "verify_mysql_mcp", False))
     mysql = detect_mysql_mcp(repo, verify=verify_mysql, timeout=getattr(args, "mysql_mcp_timeout", 12))
+    mobile_next_actions = [
+        "下一步：连接 Android 真机（adb devices 可见且 authorized），运行 doctor。",
+        "运行 install-mobile-e2e 生成 tests/e2e-mobile 骨架与 mobile-e2e 任务模板。",
+        "risk 分析阶段使用 analyze-risks --surface mobile（无源码时不做关键词扫描）。",
+    ]
+    next_actions = mobile_next_actions if mobile_only else [
+        # 受众是「正在执行这条命令的人」——通常是 agent。不要去写「回到 agent 说句话」，
+        # 那对 agent 自身是循环的，对人也没必要。
+        "下一步：运行 doctor --strict --check-services 体检环境。",
+        "缺什么按提示引导用户补齐：必填通常是测试账号（config/env.shared 的 "
+        "QA_USER_USERNAME/QA_USER_PASSWORD）与目标服务地址；LLM API Key 在 local/.env，"
+        "是可选的交叉审查增强，不填则该阶段跳过。",
+    ]
     summary = {
         "version": "1.0",
         "generatedAt": utc_now(),
         "repo": str(repo),
+        "projectProfile": project_profile,
         "generated": written,
         "testSuites": [suite.get("name") for suite in profile.get("suites", [])],
         "mysqlMcp": {
@@ -6988,14 +7820,7 @@ def init_project(args: argparse.Namespace) -> None:
             "serverName": mysql.get("serverName"),
             **({"verify": mysql["verify"]} if mysql.get("verify") else {}),
         },
-        "nextActions": [
-            # 受众是「正在执行这条命令的人」——通常是 agent。不要去写「回到 agent 说句话」，
-            # 那对 agent 自身是循环的，对人也没必要。
-            "下一步：运行 doctor --strict --check-services 体检环境。",
-            "缺什么按提示引导用户补齐：必填通常是测试账号（config/env.shared 的 "
-            "QA_USER_USERNAME/QA_USER_PASSWORD）与目标服务地址；LLM API Key 在 local/.env，"
-            "是可选的交叉审查增强，不填则该阶段跳过。",
-        ],
+        "nextActions": next_actions,
     }
     if getattr(args, "json", None):
         write_json(Path(args.json).resolve(), summary)
@@ -7063,7 +7888,8 @@ def init_config(args: argparse.Namespace) -> None:
             print(f"已生成 Codex MCP 配置：{codex['codexConfigPath']}")
 
     # Playwright Test Agents（每个 loop 独立安装，已存在则跳过）
-    for loop in loops:
+    # mobile profile 不进入这条链路：没有 Playwright 项目，装 agents 只会污染仓库。
+    for loop in ([] if getattr(args, "skip_playwright_agents", False) else loops):
         playwright = detect_playwright_assets(repo)
         if has_playwright_test_agents(playwright, loop):
             print(f"已检测到 Playwright Test Agents ({loop})：{summarize_playwright(playwright)}")
@@ -7397,8 +8223,12 @@ def _derive_case_id(stem: str) -> str:
 def _record_run_sidecar(repo: Path, case_id: str, task_id: str, script_name: str,
                         return_code: int, stdout: str, stderr: str,
                         case_ids: list[str] | None = None,
-                        duration_ms: int | None = None) -> None:
-    """写 runs/run-*.log + run-*.meta.json（聚合唯一事实源）。"""
+                        duration_ms: int | None = None) -> dict[str, Any]:
+    """写 runs/run-*.log + run-*.meta.json（聚合唯一事实源）。
+
+    返回 sidecar dict：移动端证据要把这里的 logFile 作为 runLog 写进 manifest，
+    才能证明「这些截图属于这一轮执行」，而不是上一次留下的。
+    """
     runs_dir = repo / ".qa-agent" / "runs"
     runs_dir.mkdir(parents=True, exist_ok=True)
     slug = spec_slug(case_id) or "default"
@@ -7436,6 +8266,7 @@ def _record_run_sidecar(repo: Path, case_id: str, task_id: str, script_name: str
     sidecar_path = runs_dir / f"run-{case_id}-{slug}-{epoch}.meta.json"
     write_json(sidecar_path, sidecar)
     print(f"[ming-qa] 日志: {log_path}")
+    return sidecar
 
 
 def interpreter_argv_for_script(script_path: Path) -> list[str]:
@@ -7458,6 +8289,20 @@ def interpreter_argv_for_script(script_path: Path) -> list[str]:
             raise QaAgentError(f"{suffix} 脚本需要 Node.js，但 PATH 里找不到 node")
         return [node, str(script_path)]
     return [shutil.which("bash") or "bash", str(script_path)]
+
+
+def _resolve_run_timeout(args: argparse.Namespace, script_path: Path) -> int:
+    """移动端脚本默认 300s，其他脚本保持 120s。
+
+    完整的移动端结算链路实测约 160s，120s 会把正常流程判成超时；
+    路径里带 e2e-mobile 或显式 --mobile 时放宽，避免每个项目手动加 --timeout。
+    """
+    explicit = getattr(args, "timeout", None)
+    if explicit is not None:
+        return int(explicit)
+    if getattr(args, "mobile", False) or "e2e-mobile" in str(script_path):
+        return 300
+    return 120
 
 
 def run_with_env(args: argparse.Namespace) -> None:
@@ -7498,10 +8343,11 @@ def run_with_env(args: argparse.Namespace) -> None:
     env_os.update(env_vars)
     env_os.update(extra_vars)
     env_os["PYTHONIOENCODING"] = "utf-8"
+    timeout = _resolve_run_timeout(args, script_path)
     started = time.monotonic()
     result = sp.run(argv, cwd=str(repo), env=env_os,
                     capture_output=True, encoding="utf-8", errors="replace",
-                    timeout=getattr(args, "timeout", 120))
+                    timeout=timeout)
     duration_ms = int((time.monotonic() - started) * 1000)
     if result.stdout:
         print(result.stdout)
@@ -7524,6 +8370,83 @@ def run_with_env(args: argparse.Namespace) -> None:
 
     if result.returncode != 0:
         raise SystemExit(result.returncode)
+
+
+RUN_TIMEOUT_EXIT_CODE = MOBILE_E2E_TIMEOUT_EXIT_CODE
+
+
+def _as_text(value: Any) -> str:
+    """subprocess 超时异常里给的是 bytes（即使传了 encoding）；统一成 str。"""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", "replace")
+    return value or ""
+
+
+def _execute_and_record(
+    repo: Path,
+    cmd: list[str],
+    *,
+    cwd: Path,
+    env_os: dict[str, str],
+    timeout: int,
+    case_id: str,
+    task_id: str,
+    script_name: str,
+    label: str,
+    no_tests_marker: str | None = None,
+) -> tuple[subprocess.CompletedProcess, int, dict[str, Any] | None, bool]:
+    """跑一条命令、打印输出、写 run sidecar——`run-e2e` 与 `run-mobile-e2e` 共用。
+
+    这两条路径原先各写一遍 subprocess + 超时 + sidecar，于是只有移动端那条捕获了
+    TimeoutExpired：Playwright 超时同样会「没写 sidecar」，在证据链里看起来像没跑过。
+    共同实现一次，行为才一致。
+
+    `no_tests_marker` 命中且没有超时时，说明 runner 退出码 0 但一条测试都没跑
+    （spec 路径/过滤写错）。这种情况**不写 sidecar**：写了等于把「没跑」记成「跑过」。
+    返回的 sidecar 为 None，由调用方决定怎么报错。
+    """
+    started = time.monotonic()
+    timed_out = False
+    try:
+        result = subprocess.run(
+            cmd, cwd=str(cwd), env=env_os,
+            capture_output=True, encoding="utf-8", errors="replace",
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        # 超时也要留下执行记录：否则「跑挂了」在证据链里等于「没跑过」，
+        # 下一次聚合会把这条用例当成未执行，而不是失败。
+        timed_out = True
+        result = subprocess.CompletedProcess(
+            cmd, RUN_TIMEOUT_EXIT_CODE,
+            _as_text(getattr(exc, "stdout", "")),
+            _as_text(getattr(exc, "stderr", "")) + f"\n[qa] 子进程超时（{timeout}s），已终止",
+        )
+    duration_ms = int((time.monotonic() - started) * 1000)
+    if result.stdout:
+        print(result.stdout)
+    if result.stderr:
+        print(result.stderr, file=sys.stderr)
+
+    combined = (result.stdout or "") + (result.stderr or "")
+    if timed_out:
+        print(
+            f"[{label}] 超时（{timeout}s）：已记为退出码 {RUN_TIMEOUT_EXIT_CODE}，仍写 run 记录",
+            file=sys.stderr,
+        )
+    elif no_tests_marker and no_tests_marker in combined:
+        print(
+            f"[{label}] 没有匹配到任何测试（{no_tests_marker}）；不写 run 记录，避免把「没跑」记成「跑过」",
+            file=sys.stderr,
+        )
+        return result, duration_ms, None, timed_out
+
+    sidecar = _record_run_sidecar(
+        repo, case_id, task_id,
+        script_name, result.returncode, result.stdout, result.stderr,
+        duration_ms=duration_ms,
+    )
+    return result, duration_ms, sidecar, timed_out
 
 
 def run_e2e(args: argparse.Namespace) -> None:
@@ -7561,18 +8484,6 @@ def run_e2e(args: argparse.Namespace) -> None:
     if getattr(args, "project", None):
         cmd += ["--project", args.project]
 
-    import subprocess as sp
-    print(f"[run-e2e] {' '.join(cmd)} (cwd={pw_dir})")
-    started = time.monotonic()
-    result = sp.run(cmd, cwd=str(pw_dir), env=env_os,
-                    capture_output=True, encoding="utf-8", errors="replace",
-                    timeout=getattr(args, "timeout", 180))
-    duration_ms = int((time.monotonic() - started) * 1000)
-    if result.stdout:
-        print(result.stdout)
-    if result.stderr:
-        print(result.stderr, file=sys.stderr)
-
     explicit_case_id = getattr(args, "case_id", None)
     stem = spec.name
     for suffix in (".spec.ts", ".spec.js", ".spec.tsx", ".spec.mjs"):
@@ -7580,27 +8491,116 @@ def run_e2e(args: argparse.Namespace) -> None:
             stem = stem[: -len(suffix)]
             break
     case_id = explicit_case_id.strip() if explicit_case_id else _derive_case_id(stem)
-    _record_run_sidecar(
-        repo, case_id, getattr(args, "task_id", None) or "",
-        spec.name, result.returncode, result.stdout, result.stderr,
-        duration_ms=duration_ms,
+
+    print(f"[run-e2e] {' '.join(cmd)} (cwd={pw_dir})")
+    result, _duration_ms, _sidecar, _timed_out = _execute_and_record(
+        repo, cmd,
+        cwd=pw_dir,
+        env_os=env_os,
+        timeout=getattr(args, "timeout", 180),
+        case_id=case_id,
+        task_id=getattr(args, "task_id", None) or "",
+        script_name=spec.name,
+        label="run-e2e",
     )
 
     if result.returncode != 0:
         raise SystemExit(result.returncode)
 
 
+def _mobile_ime_snapshot(adb: str, serial: str) -> dict[str, Any] | None:
+    """记录并禁用中文输入法。
+
+    Mobilewright 的 fill() 依赖输入法注入；微信/搜狗等中文输入法会拦截
+    `input text`，表现为「点击成功、文本没进去」或「文本进了上一个字段」。
+    回归执行前统一禁用、结束后恢复，和 mobile_adb.py 的按次禁用是同一个原因。
+    """
+    def _run(*args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [adb, "-s", serial, "shell", *args],
+            capture_output=True, encoding="utf-8", errors="replace", timeout=30,
+        )
+
+    try:
+        default = (_run("settings", "get", "secure", "default_input_method").stdout or "").strip()
+        listed = _run("ime", "list", "-s")
+        imes = [line.strip() for line in (listed.stdout or "").splitlines() if line.strip()]
+        if not imes:
+            return None
+        for ime in imes:
+            _run("ime", "disable", ime)
+        return {"default": default, "imes": imes}
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _restore_mobile_imes(adb: str, serial: str, snapshot: dict[str, Any] | None) -> None:
+    if not snapshot:
+        return
+    for ime in snapshot.get("imes", []):
+        subprocess.run(
+            [adb, "-s", serial, "shell", "ime", "enable", ime],
+            capture_output=True, timeout=30,
+        )
+    default = snapshot.get("default")
+    if default:
+        subprocess.run(
+            [adb, "-s", serial, "shell", "ime", "set", default],
+            capture_output=True, timeout=30,
+        )
+
+
+def _mobile_e2e_timeout_budget(
+    args: argparse.Namespace, test_timeout_ms: int | None
+) -> tuple[int, list[str]]:
+    """算出子进程超时，并把「至少大于最坏测试耗时」这条从注释变成代码。
+
+    原来的 `--timeout` 只是 help 里写着「必须大于 --test-timeout」，没有校验，
+    也没把 retries 算进去：`--test-timeout 240000` + `--retries 1` 的最坏耗时是
+    480s，而默认 `--timeout` 是 420s —— 恰好会在第二次重试中途把进程杀掉，
+    表现为「测试没结论、日志没记录」。
+    """
+    notes: list[str] = []
+    retries = getattr(args, "retries", None)
+    try:
+        retry_count = max(0, int(retries)) if retries is not None else 0
+    except (TypeError, ValueError):
+        retry_count = 0
+    worst_ms = 0
+    if test_timeout_ms:
+        worst_ms = int(test_timeout_ms) * (retry_count + 1)
+    explicit = getattr(args, "timeout", None)
+    if explicit is None:
+        budget = MOBILE_E2E_DEFAULT_TIMEOUT_S
+        if worst_ms:
+            budget = max(budget, worst_ms // 1000 + MOBILE_E2E_TIMEOUT_MARGIN_S)
+        return budget, notes
+    try:
+        budget = int(explicit)
+    except (TypeError, ValueError):
+        budget = MOBILE_E2E_DEFAULT_TIMEOUT_S
+    if worst_ms:
+        minimum = worst_ms // 1000 + MOBILE_E2E_TIMEOUT_MARGIN_S
+        if budget < minimum:
+            notes.append(
+                f"--timeout={budget}s 小于最坏测试耗时 {worst_ms // 1000}s"
+                f"（test-timeout {int(test_timeout_ms)}ms × (retries {retry_count} + 1) + 余量），"
+                f"已自动放宽到 {minimum}s"
+            )
+            budget = minimum
+    return budget, notes
+
+
 def run_mobile_e2e(args: argparse.Namespace) -> None:
-    """执行 Mobilewright spec，并写 run 证据（log + sidecar）。
+    """执行 Mobilewright spec，并写 run 证据（log + sidecar + 可选 manifest）。
 
     与 run-e2e 对称：run-e2e 跑 Playwright，这里跑 `npx mobilewright test`。
     两者都写 runs/run-*.log + .meta.json，供 aggregate-runs 统一聚合——
     回归执行必须和首次执行落在同一条证据链上。
 
-    注意：这条命令只负责执行与记录，不替 agent 生成证据清单。移动端的
-    三类证据（元素树 / 截图 / logcat）由执行阶段写入
-    `.qa-agent/runs/<run-id>/mobile/<scope>/manifest.json`，再由
-    `assert-mobile-evidence` 校验。
+    传入 `--app-package` 时，执行后会再用 adb 抓一次元素树 / 截图 / logcat，
+    写入 `.qa-agent/runs/<run-id>/mobile/<scope>/manifest.json`。证据契约要求
+    「跑过的 task 有证据」，只写 sidecar 不够。`--no-evidence` 可关闭。
     """
     repo = Path(args.repo).resolve()
     spec = Path(args.spec)
@@ -7614,7 +8614,22 @@ def run_mobile_e2e(args: argparse.Namespace) -> None:
         raise QaAgentError("npx was not found in PATH; install Node.js/npm first")
 
     project = getattr(args, "project", None) or "android"
-    cmd = [npx, "mobilewright", "test", "--project", project, str(spec)]
+    # 优先传相对 repo 的 POSIX 路径：Mobilewright 把参数当文件过滤正则，
+    # 绝对 Windows 路径（带反斜杠）会匹配不到任何测试，报 "No tests found"。
+    try:
+        spec_arg = spec.relative_to(repo).as_posix()
+    except ValueError:
+        spec_arg = spec.as_posix()
+    # --project 必须用 `=` 形式且放在 spec 之前：`--project android <spec>`
+    # 会被 CLI 当成「两个 project 名」，报 Project(s) ... not found。
+    cmd = [npx, "mobilewright", "test", spec_arg, f"--project={project}"]
+    if getattr(args, "retries", None) is not None:
+        cmd.append(f"--retries={args.retries}")
+    # 手机端一个完整下单流程 ~2 分钟，config 里的 90s 默认值会截断；
+    # 把测试级超时显式传给 runner，和子进程超时分开控制。
+    test_timeout = getattr(args, "test_timeout", None)
+    if test_timeout:
+        cmd.append(f"--timeout={int(test_timeout)}")
 
     env_os = os.environ.copy()
     env_os["PYTHONIOENCODING"] = "utf-8"
@@ -7625,19 +8640,49 @@ def run_mobile_e2e(args: argparse.Namespace) -> None:
             key, _, val = item.partition("=")
             env_os[key] = val
 
-    print(f"[run-mobile-e2e] {' '.join(cmd)} (cwd={repo})")
-    started = time.monotonic()
-    result = subprocess.run(
-        cmd, cwd=str(repo), env=env_os,
-        capture_output=True, encoding="utf-8", errors="replace",
-        timeout=getattr(args, "timeout", 300),
-    )
-    duration_ms = int((time.monotonic() - started) * 1000)
-    if result.stdout:
-        print(result.stdout)
-    if result.stderr:
-        print(result.stderr, file=sys.stderr)
+    adb = None
+    serial = (getattr(args, "device", None) or "").strip()
+    # 只有需要写证据时才碰设备；纯 sidecar 记录不应依赖 adb（也便于单元测试）。
+    if getattr(args, "evidence", True):
+        if not serial:
+            devices = _detect_adb_devices(repo)
+            if len(devices.get("authorized", [])) == 1:
+                serial = devices["authorized"][0]
+        try:
+            adb = _find_adb()
+        except Exception as exc:  # 静默吞掉会让「设备连着却没写证据」变成谜
+            print(
+                f"[run-mobile-e2e] 未找到可用的 adb（{exc}）；本次只写 run sidecar，"
+                f"不产出移动端证据。装 Platform Tools 或用 --no-evidence 明确关掉",
+                file=sys.stderr,
+            )
+            adb = None
+        if adb and not serial:
+            print(
+                "[run-mobile-e2e] 有 adb 但没有唯一已授权设备；用 --device <serial> 指定，"
+                "否则跳过移动端证据",
+                file=sys.stderr,
+            )
 
+    # 默认不动输入法。整轮禁用 IME 一旦赶上进程被 kill，设备会停在「没有键盘」的
+    # 状态（mobile_adb.type_text 的注释记的就是这个坑）；需要时显式 --disable-ime，
+    # 并用 atexit 兜底恢复。
+    ime_snapshot = None
+    if getattr(args, "disable_ime", False) and adb and serial:
+        ime_snapshot = _mobile_ime_snapshot(adb, serial)
+        if ime_snapshot:
+            atexit.register(_restore_mobile_imes, adb, serial, ime_snapshot)
+
+    timeout_s, timeout_notes = _mobile_e2e_timeout_budget(args, test_timeout)
+    for note in timeout_notes:
+        print(f"[run-mobile-e2e] {note}", file=sys.stderr)
+
+    # 证据目录与 run 日志共用同一个 run_id：否则 manifest 落在一次执行、
+    # sidecar 落在另一次，谁也证明不了「这些截图是这一轮的」。
+    run_id = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
+    started_at = dt.datetime.now(_CN_TZ).isoformat(timespec="seconds")
+
+    print(f"[run-mobile-e2e] {' '.join(cmd)} (cwd={repo})")
     stem = spec.name
     for suffix in (".spec.ts", ".spec.js", ".spec.tsx", ".spec.mjs"):
         if stem.endswith(suffix):
@@ -7645,11 +8690,72 @@ def run_mobile_e2e(args: argparse.Namespace) -> None:
             break
     explicit_case_id = (getattr(args, "case_id", None) or "").strip()
     case_id = explicit_case_id or _derive_case_id(stem)
-    _record_run_sidecar(
-        repo, case_id, getattr(args, "task_id", None) or "",
-        spec.name, result.returncode, result.stdout, result.stderr,
-        duration_ms=duration_ms,
-    )
+    task_id = getattr(args, "task_id", None) or ""
+
+    try:
+        result, duration_ms, sidecar, timed_out = _execute_and_record(
+            repo, cmd,
+            cwd=repo,
+            env_os=env_os,
+            timeout=timeout_s,
+            case_id=case_id,
+            task_id=task_id,
+            script_name=spec.name,
+            label="run-mobile-e2e",
+            no_tests_marker="No tests found",
+        )
+    finally:
+        _restore_mobile_imes(adb, serial, ime_snapshot)
+    finished_at = dt.datetime.now(_CN_TZ).isoformat(timespec="seconds")
+
+    if sidecar is None:
+        # 路径/过滤写错时 runner 退出码为 0，但一条测试都没跑；此时写 sidecar
+        # 会把「没跑」伪装成「跑过」，必须显式失败且不记录执行。
+        print("[run-mobile-e2e] 检查 --spec 相对路径与 --project", file=sys.stderr)
+        raise SystemExit(2)
+
+    app_package = (getattr(args, "app_package", None) or "").strip()
+    if getattr(args, "evidence", True) and app_package and adb and serial:
+        scope = spec.parent.name or "mobile"
+        try:
+            from mobile_adb import MobileAdb
+
+            device = MobileAdb(serial=serial, adb=adb)
+            evidence_dir = device.save_evidence(
+                repo, case_id, task_id,
+                locator=getattr(args, "evidence_locator", None) or "tree",
+                duration_ms=duration_ms,
+                note=f"mobilewright {'PASS' if result.returncode == 0 else 'FAIL'}",
+                run_id=run_id,
+                scope=scope,
+                package=app_package,
+                run_log=str(sidecar.get("logFile") or ""),
+                started_at=started_at,
+                finished_at=finished_at,
+            )
+            print(f"[run-mobile-e2e] 已写移动端证据：{scope}")
+        except Exception as exc:  # 证据失败不能掩盖测试结论，但必须可见且可查
+            print(f"[run-mobile-e2e] 证据落盘失败：{exc}", file=sys.stderr)
+            # 只打印的话，报告里这条证据就是「不存在」而不是「采集失败」；
+            # 落一份错误记录，门禁与报告都能指着它说话。
+            try:
+                write_json(
+                    repo / ".qa-agent" / "runs" / f"{run_id}.evidence-error.json",
+                    {
+                        "version": "1.0",
+                        "runId": run_id,
+                        "caseId": case_id,
+                        "taskId": task_id,
+                        "scope": scope,
+                        "package": app_package,
+                        "device": serial,
+                        "error": f"{type(exc).__name__}: {exc}",
+                        "runLog": sidecar.get("logFile"),
+                        "capturedAt": utc_now(),
+                    },
+                )
+            except OSError as write_exc:
+                print(f"[run-mobile-e2e] 证据错误记录也写不进去：{write_exc}", file=sys.stderr)
 
     if result.returncode != 0:
         raise SystemExit(result.returncode)
@@ -7845,16 +8951,23 @@ def summarize_surefire(args: argparse.Namespace) -> None:
 
 
 def checks_to_environment_checks(checks: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [
-        {
+    entries: list[dict[str, Any]] = []
+    for check in checks:
+        entry = {
             "id": "ENV-" + re.sub(r"[^A-Za-z0-9]+", "-", str(check.get("name", "check")).upper()).strip("-"),
             "name": check.get("name", ""),
+            # 豁免不改变事实：检查仍然是 blocked，只额外标注 ignored，避免报告把
+            # 「用户知情后放行」写成「环境就绪」。
             "status": "passed" if check.get("ok") else "blocked",
             "detail": check.get("detail", ""),
+            "required": bool(check.get("required", True)),
             "requiredFor": ["quality-assurance-agent"],
         }
-        for check in checks
-    ]
+        if check.get("ignored"):
+            entry["ignored"] = True
+            entry["ignoreReason"] = check.get("ignoreReason", "")
+        entries.append(entry)
+    return entries
 
 
 def doctor(args: argparse.Namespace) -> None:
@@ -7996,8 +9109,16 @@ def doctor(args: argparse.Namespace) -> None:
         loops = [AGENT_CLAUDE, AGENT_CODEX] if agent == AGENT_BOTH else [agent]
 
         # Playwright Test Agents（每个 loop 独立安装）
-        for loop in loops:
-            playwright = detect_playwright_assets(repo)
+        # mobile profile 不装：没有 Web 项目，装 agents 只会污染仓库。
+        playwright = detect_playwright_assets(repo)
+        mobile_profile = False
+        profile_path = repo / ".qa-agent" / "profiles" / "project-test-profile.json"
+        if profile_path.exists():
+            try:
+                mobile_profile = json.loads(profile_path.read_text(encoding="utf-8")).get("profileMode") == "mobile"
+            except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+                mobile_profile = False
+        for loop in ([] if mobile_profile else loops):
             if not has_playwright_test_agents(playwright, loop):
                 install = install_playwright_agents_in_repo(
                     repo, loop=loop, timeout=300, skip_if_present=True, dry_run=False, no_yes=False,
@@ -8106,15 +9227,72 @@ def doctor(args: argparse.Namespace) -> None:
                         required=True,
                         next_action=action,
                     )
+                # 只有 agent 直驱（targetFile=@agent:mobile-mcp）才依赖 mobile-mcp / mobilecli；
+                # 脚本驱动走 mobile_adb.py（adb 直连），不依赖这两者。把「本仓库默认走脚本驱动」
+                # 当成「必须注册 MCP」会逼用户为用不到的服务改会话配置。
+                uses_agent_driver = any(
+                    str(task.get("targetFile", "")).startswith("@agent:mobile-mcp")
+                    or str(task.get("driver", "")) == "mobile-mcp"
+                    for task in mobile_tasks
+                )
                 mcp_registered = _mobile_mcp_registered(repo)
+                if mcp_registered:
+                    mcp_detail = "mobile-mcp 已注册"
+                elif uses_agent_driver:
+                    mcp_detail = "mobile-mcp 未注册；agent 直驱（@agent:mobile-mcp）必须注册并重启会话"
+                else:
+                    mcp_detail = "mobile-mcp 未注册（脚本驱动不需要；需要 agent 直驱时再注册）"
                 add(
                     "mobile_mcp",
                     mcp_registered,
-                    "mobile-mcp 已注册" if mcp_registered else "mobile-mcp 未注册",
-                    required=True,
+                    mcp_detail,
+                    required=uses_agent_driver,
                     next_action="" if mcp_registered else
                     "claude mcp add mobile-mcp -- npx -y @mobilenext/mobile-mcp@latest",
                 )
+                mobilecli = _mobile_cli_info(repo=repo)
+                if mobilecli["available"]:
+                    detail = (
+                        "由项目内 mobilewright 自带"
+                        if mobilecli.get("bundled") else mobilecli["path"]
+                    )
+                    if mobilecli["daemon"]:
+                        detail += " | daemon: " + mobilecli["daemon"].splitlines()[0][:200]
+                else:
+                    detail = (
+                        "未找到 mobilecli；agent 直驱（@agent:mobile-mcp）会静默列不出设备"
+                        if uses_agent_driver
+                        else "未找到 mobilecli（脚本驱动不需要；仅 agent 直驱需要）"
+                    )
+                add(
+                    "mobile_cli",
+                    mobilecli["available"],
+                    detail,
+                    required=uses_agent_driver,
+                    next_action="" if mobilecli["available"] else
+                    "确认 mobile-mcp 安装完整；必要时执行 mobilecli daemon stop 后重试",
+                )
+                # 回归层用 Mobilewright 时，运行时（包 + config）是必须项。
+                uses_mobilewright = any(
+                    str(task.get("targetFile", "")).endswith((".spec.ts", ".spec.js", ".spec.mjs"))
+                    for task in mobile_tasks
+                )
+                if uses_mobilewright:
+                    pkg_ok = (repo / "node_modules" / "mobilewright").exists()
+                    config_ok = (repo / "mobilewright.config.ts").exists()
+                    missing = []
+                    if not pkg_ok:
+                        missing.append("mobilewright 未安装")
+                    if not config_ok:
+                        missing.append("mobilewright.config.ts 缺失")
+                    add(
+                        "mobilewright_runtime",
+                        pkg_ok and config_ok,
+                        "runtime ready" if pkg_ok and config_ok else "; ".join(missing),
+                        required=True,
+                        next_action="" if pkg_ok and config_ok else
+                        "install-mobile-e2e --repo . --with-mobilewright --bundle-id <包名>",
+                    )
 
             if requirements["ios"]:
                 ios_info = _detect_ios_devices()
@@ -8178,12 +9356,26 @@ def doctor(args: argparse.Namespace) -> None:
                 )
         services_data = load_services_config(repo)
         services = services_data.get("services", []) if isinstance(services_data.get("services"), list) else []
+        # mobile profile 本来就没有本地服务栈；空 services 是预期状态，不是配置缺失。
+        mobile_profile_mode = False
+        profile_file = repo / ".qa-agent" / "profiles" / "project-test-profile.json"
+        if profile_file.exists():
+            try:
+                mobile_profile_mode = json.loads(
+                    profile_file.read_text(encoding="utf-8")
+                ).get("profileMode") == "mobile"
+            except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+                mobile_profile_mode = False
         add(
             "services_config",
-            bool(services),
-            f"{len(services)} services" if services else "missing config/services.json",
+            bool(services) or mobile_profile_mode,
+            (f"{len(services)} services" if services else
+             "0 services（mobile profile：无本地服务栈）" if mobile_profile_mode else
+             "missing config/services.json"),
             category="services",
-            next_action=f"运行 {self_invocation()} init-project --repo ." if not services else "",
+            required=not mobile_profile_mode,
+            next_action=(f"运行 {self_invocation()} init-project --repo ."
+                         if not services and not mobile_profile_mode else ""),
         )
         for service in services:
             if not isinstance(service, dict):
@@ -8281,14 +9473,25 @@ def doctor(args: argparse.Namespace) -> None:
     add(DEFAULT_BASE_URL_ENV, True, "configured" if base_url else "not set（No built-in default; set it to enable multi-model review）", category="secrets")
 
     failed = [check for check in checks if not check["ok"]]
-    for check in checks:
-        mark = "OK" if check["ok"] else ("FAIL" if check.get("required", True) else "WARN")
-        suffix = f"；处理建议={check['nextAction']}" if check.get("nextAction") else ""
-        print(f"[{mark}] {check['name']}: {check['detail']}{suffix}")
     # 显式豁免：--ignore <check 名>（可重复）。被豁免的项仍然执行、仍然出现在输出里，
     # 只是不计入阻塞——用于「我知道它是这个状态，仍要继续」的场景。
-    # 豁免必须可见可追溯，不能变成静默跳过。
+    # 豁免必须可见可追溯，不能变成静默跳过：check 上打 ignored/ignoreReason，
+    # 并且 environment-checks.json 也会带上，报告阶段可以照实呈现。
     ignored = {str(x).strip() for x in (getattr(args, "ignore", None) or []) if str(x).strip()}
+    ignore_reason = "按 --ignore 显式豁免：问题依旧存在，不计入阻塞"
+    for check in checks:
+        if not check["ok"] and check.get("required", True) and check["name"] in ignored:
+            check["ignored"] = True
+            check["ignoreReason"] = ignore_reason
+    for check in checks:
+        if check.get("ignored"):
+            mark = "WAIVED"
+        else:
+            mark = "OK" if check["ok"] else ("FAIL" if check.get("required", True) else "WARN")
+        suffix = f"；处理建议={check['nextAction']}" if check.get("nextAction") else ""
+        if check.get("ignored"):
+            suffix += f"；{ignore_reason}"
+        print(f"[{mark}] {check['name']}: {check['detail']}{suffix}")
     blocking_failed = [
         check for check in failed
         if check.get("required", True) and check["name"] not in ignored
@@ -8535,7 +9738,9 @@ def collect_report_source_paths(args: argparse.Namespace) -> list[tuple[str, Pat
         ("code-review", getattr(args, "code_review", None)),
         ("risk-analysis", getattr(args, "risk_analysis", None)),
         ("completion-check", getattr(args, "completion_check", None)),
-        ("readiness-check", getattr(args, "readiness_check", None)),
+        # readiness-check 不列入：它本身依赖 report-freshness-check，
+        # 再把它当成报告的「源」会形成循环——assert-readiness 每次重写
+        # readiness-check 都会让刚渲染的报告变「陈旧」，永远收敛不了。
         ("spec-tasks", getattr(args, "spec_tasks", None)),
     ]:
         if value:
@@ -9626,6 +10831,10 @@ _REPORT_CSS = """
     .verdict.notready a.stat:hover { background:rgba(122,39,26,.08); }
     .verdict a.stat .n, .verdict a.stat .l { color:inherit; }
 
+    .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:12px; margin:0 0 12px; }
+    .card { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:14px 16px; }
+    .card .label { color:var(--muted); font-size:11.5px; letter-spacing:.06em; text-transform:uppercase; }
+    .card .value { color:var(--ink); font-size:20px; font-weight:700; margin-top:4px; }
     .panel { background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:22px 24px; margin-top:12px; }
     .panel + .panel { margin-top:14px; }
     .panel h3 { margin:0 0 14px; font-size:15px; font-weight:700; color:var(--ink); }
@@ -9951,8 +11160,9 @@ def _render_appendix(legacy: list[dict], scope_ledger: dict, env_checks: list[di
 """
 
 # === 项目增强函数 (from project) ===
-def _render_case_matrix(in_scope: list[dict], run_data: dict, spec_tasks: dict) -> str:
-    rows_html = "".join(_render_case_row(c, run_data, spec_tasks) for c in in_scope)
+def _render_case_matrix(in_scope: list[dict], run_data: dict, spec_tasks: dict,
+                        runs_href: str = "") -> str:
+    rows_html = "".join(_render_case_row(c, run_data, spec_tasks, runs_href) for c in in_scope)
     return f"""
 <section class="block" id="cases">
   <h2>用例矩阵 · 本轮范围（{len(in_scope)} 条）</h2>
@@ -9973,7 +11183,8 @@ def _render_case_matrix(in_scope: list[dict], run_data: dict, spec_tasks: dict) 
 """
 
 # === 项目增强函数 (from project) ===
-def _render_case_row(case: dict, run_data: dict, spec_tasks: dict) -> str:
+def _render_case_row(case: dict, run_data: dict, spec_tasks: dict,
+                     runs_href: str = "") -> str:
     cid = html.escape(str(case.get("id", "-")))
     pri = str(case.get("priority", ""))
     status = str(case.get("status", ""))
@@ -10025,10 +11236,19 @@ def _render_case_row(case: dict, run_data: dict, spec_tasks: dict) -> str:
         att_rows = ""
         for a in run.get("attempts", []):
             n = a.get("n", "?")
-            log_file = html.escape(str(a.get("logFile", "-"))[-60:])
+            raw_log = str(a.get("logFile", "") or "")
+            log_name = html.escape(raw_log[-60:])
+            # 只写文件名等于让报告断在最后一厘米：说「有日志」却点不开。
+            if runs_href and raw_log:
+                log_cell = (
+                    f'<a class="mono" style="font-size:11px;" '
+                    f'href="{html.escape(runs_href + "/" + _url_name(raw_log))}">{log_name}</a>'
+                )
+            else:
+                log_cell = f'<span class="mono" style="font-size:11px;">{log_name or "-"}</span>'
             exit_code = a.get("exitCode", "?")
             outcome = a.get("outcome", "?")
-            att_rows += f'<tr><td>{n}</td><td class="mono" style="font-size:11px;">{log_file}</td><td>{exit_code}</td><td>{_outcome_badge(outcome)}</td></tr>'
+            att_rows += f'<tr><td>{n}</td><td>{log_cell}</td><td>{exit_code}</td><td>{_outcome_badge(outcome)}</td></tr>'
         evidence_html = f'''
       <details>
         <summary>执行证据 · {run.get("totalAttempts",0)} 次执行 · 最终 {_outcome_badge(run.get("finalOutcome",""))}</summary>
@@ -10095,13 +11315,15 @@ def _render_code_review(cr_data: dict, review_scope: list[str] | None = None) ->
         blocking = sum(1 for f in findings if str(f.get("severity", "")).upper() in ("P0", "P1"))
     title_note = " · 均非阻塞，不阻塞本次合并" if blocking == 0 else f" · 含 {blocking} 条阻塞"
     # Summary table
+    has_category = any(f.get("category") for f in findings)
     rows = ""
     for f in findings:
         fid = html.escape(str(f.get("id", "-")))
         sev = str(f.get("severity", "")).upper()
         cat = _zh_cat(str(f.get("category", "")))
         summary = html.escape(_finding_title(f))
-        rows += f'<tr><td><code>{fid}</code></td><td>{_pri_badge(sev)}</td><td>{cat}</td><td>{summary}</td><td>{_verdict_badge(str(f.get("verdict", "")))}</td></tr>'
+        cat_cell = f'<td>{cat}</td>' if has_category else ""
+        rows += f'<tr><td><code>{fid}</code></td><td>{_pri_badge(sev)}</td>{cat_cell}<td>{summary}</td><td>{_verdict_badge(str(f.get("verdict", "")))}</td></tr>'
 
     # Expandable details per finding
     details_html = ""
@@ -10120,7 +11342,7 @@ def _render_code_review(cr_data: dict, review_scope: list[str] | None = None) ->
       <div class="details-body">
         <p><strong>位置：</strong>{location}</p>
         <p><strong>问题：</strong>{summary}</p>
-        {f'<p><strong>失败场景：</strong>{scenario}</p>' if scenario else ''}
+        {f'<p><strong>证据 / 复现线索：</strong>{scenario}</p>' if scenario else ''}
         {f'<p><strong>建议：</strong>{recommendation}</p>' if recommendation else ''}
       </div>
     </details>'''
@@ -10132,18 +11354,19 @@ def _render_code_review(cr_data: dict, review_scope: list[str] | None = None) ->
   <div class="panel">
     <h3>代码审查范围</h3>
     <details>
-      <summary>审查覆盖源码（{len(review_scope)} 个文件）</summary>
+      <summary>代码审查覆盖（{len(review_scope)} 个文件）</summary>
       <ul style="margin:6px 0 0;padding-left:20px;font-size:12.5px;color:var(--ink-soft);line-height:1.8;">{items}</ul>
     </details>
   </div>'''
 
     findings_html = ""
     if findings:
+        cat_header = '<th style="width:170px;">类型</th>' if has_category else ""
         findings_html = f'''
   <div class="panel" id="code-review">
     <h3>代码审查发现（{len(findings)} 条{title_note}）</h3>
     <table class="compact">
-      <thead><tr><th style="width:80px;">ID</th><th style="width:56px;">优先级</th><th style="width:170px;">类型</th><th>摘要</th><th style="width:110px;">处置</th></tr></thead>
+      <thead><tr><th style="width:80px;">ID</th><th style="width:56px;">优先级</th>{cat_header}<th>摘要</th><th style="width:110px;">处置</th></tr></thead>
       <tbody>{rows}</tbody>
     </table>
     <div style="margin-top:12px;">{details_html}</div>
@@ -10158,11 +11381,12 @@ def _render_code_review(cr_data: dict, review_scope: list[str] | None = None) ->
 """
 
 # === 项目增强函数 (from project) ===
-def _render_executive_summary(scope: dict, assertions: list[dict], conditions: list[str], cr_notes: str = "", cr_next_steps: list[str] | None = None, gates_html: str = "", test_scripts: list[str] | None = None, product_src: list[str] | None = None, qa_fix_files: list[str] | None = None) -> str:
+def _render_executive_summary(scope: dict, assertions: list[dict], conditions: list[str], cr_notes: str = "", cr_next_steps: list[str] | None = None, gates_html: str = "", test_scripts: list[str] | None = None, product_src: list[str] | None = None, qa_fix_files: list[str] | None = None, missing_scripts: list[str] | None = None) -> str:
     cr_next_steps = cr_next_steps or []
     test_scripts = test_scripts or []
     product_src = product_src or []
     qa_fix_files = qa_fix_files or []
+    missing_scripts = missing_scripts or []
     scope_kv = ""
     for k, v in [
         ("模块", scope.get("module", "-")),
@@ -10210,8 +11434,16 @@ def _render_executive_summary(scope: dict, assertions: list[dict], conditions: l
             items = "".join(f'<li><code>{html.escape(str(f))}</code></li>' for f in product_src)
             src_html = f'''
     <details>
-      <summary>涉及产品源码（{len(product_src)} 个）</summary>
+      <summary>代码审查范围（{len(product_src)} 个文件）</summary>
       <ul style="margin:6px 0 0;padding-left:20px;font-size:12.5px;color:var(--ink-soft);line-height:1.8;">{items}</ul>
+    </details>'''
+        missing_html = ""
+        if missing_scripts:
+            items = "".join(f'<li><code>{html.escape(str(f))}</code></li>' for f in missing_scripts)
+            missing_html = f'''
+    <details open>
+      <summary style="color:var(--danger);">已映射但缺失的测试脚本（{len(missing_scripts)} 个）</summary>
+      <ul style="margin:6px 0 0;padding-left:20px;font-size:12.5px;color:var(--danger);line-height:1.8;">{items}</ul>
     </details>'''
         qa_fix_html = ""
         if qa_fix_files:
@@ -10225,6 +11457,7 @@ def _render_executive_summary(scope: dict, assertions: list[dict], conditions: l
   <div class="panel">
     <h3>本次交付</h3>
     {scripts_html}
+    {missing_html}
     {src_html}
     {qa_fix_html}
   </div>'''
@@ -10631,11 +11864,15 @@ def _zh_verdict(en: str) -> str:
 
 def _verdict_badge(verdict: str) -> str:
     """verdict 行动标签 + 阻塞性上色：确认缺陷=红(要修)，疑似=黄(要确认)。"""
-    v = str(verdict or "").upper()
+    raw = str(verdict or "").strip()
+    # INFO 类 finding 本来就没有处置动作；渲染成「?」会让读者以为缺数据。
+    if not raw:
+        return '<span class="b mute">—</span>'
+    v = raw.upper()
     label = html.escape(_zh_verdict(v))
     cls = {"CONFIRMED": "danger", "PLAUSIBLE": "warn", "REJECTED": "mute"}.get(v, "info")
     if v not in {"CONFIRMED", "PLAUSIBLE", "REJECTED"}:
-        label = html.escape(str(verdict or "?"))
+        label = html.escape(raw)
     return f'<span class="b {cls}">{label}</span>'
 
 # === 项目增强函数 (from project) ===
@@ -10774,7 +12011,159 @@ def _extract_cr_scope_files(cr_data: dict[str, Any]) -> list[str]:
     return []
 
 
-def _render_mobile_evidence(readiness_data: dict[str, Any]) -> str:
+def _url_name(raw: str) -> str:
+    """把 logFile / 路径取成 URL 里能用的单段文件名。"""
+    return str(raw or "").replace("\\", "/").rstrip("/").split("/")[-1]
+
+
+def _relative_url(target: Path, start: Path) -> str:
+    """给报告生成链接：同盘用相对路径，跨盘退回 file:// 绝对地址。
+
+    HTML 里不能用 Windows 反斜杠；跨盘时 os.path.relpath 会直接抛错，
+    这时留一个裸路径在 href 里等于坏链，不如给浏览器能打开的 file://。
+    """
+    try:
+        rel = os.path.relpath(str(target), str(start))
+    except ValueError:
+        try:
+            return Path(target).resolve().as_uri()
+        except (OSError, ValueError):
+            return str(target).replace("\\", "/")
+    return rel.replace("\\", "/")
+
+
+def _render_mobile_evidence_wall(
+    repo_root: Path | None, report_dir: Path | None, spec_tasks: dict[str, Any] | None
+) -> str:
+    """把移动端证据渲染成可点、可看的证据墙。
+
+    原来的报告只有 6 个数字：说「8 条证据齐了」，但报告里没有一个能点开的
+    截图或元素树，证据链在最后一厘米断掉。这里按 task 列出本轮清单的
+    元素树 / 截图 / 设备日志 / run 日志链接，截图直接内嵌缩略图。
+    """
+    if repo_root is None:
+        return ""
+    tasks = (spec_tasks or {}).get("tasks")
+    if not isinstance(tasks, list):
+        return ""
+    mobile_tasks = [
+        task for task in tasks
+        if isinstance(task, dict) and _mobile_task_platform(task) in MOBILE_PLATFORMS
+    ]
+    if not mobile_tasks:
+        return ""
+    manifests: list[dict[str, Any]] = []
+    for path in _iter_mobile_evidence_manifests(repo_root):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        data["_manifestPath"] = path
+        manifests.append(data)
+    if not manifests:
+        return ""
+    by_case: dict[str, list[dict[str, Any]]] = {}
+    by_task: dict[str, list[dict[str, Any]]] = {}
+    for manifest in manifests:
+        case_id = str(manifest.get("caseId") or "").strip().upper()
+        if case_id:
+            by_case.setdefault(case_id, []).append(manifest)
+        task_id = str(manifest.get("taskId") or "").strip()
+        if task_id:
+            by_task.setdefault(task_id, []).append(manifest)
+
+    entries: list[str] = []
+    seen: set[str] = set()
+    for task in mobile_tasks:
+        if normalize_task_status(task.get("executionStatus")) != "passed":
+            continue
+        case_id = str(task.get("sourceCaseId") or "").strip().upper()
+        task_id = str(task.get("id") or "").strip()
+        candidates = by_task.get(task_id) or (by_case.get(case_id) if case_id else [])
+        if not candidates:
+            continue
+        manifest = max(candidates, key=_manifest_mtime)
+        key = str(manifest.get("_manifestPath"))
+        if key in seen:
+            continue
+        seen.add(key)
+        entries.append(_render_mobile_evidence_entry(manifest, task_id or case_id, report_dir))
+        if len(entries) >= 20:
+            break
+    if not entries:
+        return ""
+    return f"""
+  <h3 style="margin:22px 0 10px;font-size:15px;">证据墙 · 逐条可查（{len(entries)} 条）</h3>
+  <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:12px;">
+    {"".join(entries)}
+  </div>
+  <p class="note" style="margin-top:10px;">缩略图、元素树、设备日志都是<b>测试结束后</b>补采的终态快照（manifest.captureWindow=post-run），不是断言发生那一刻的现场；断言时刻的画面要靠 Mobilewright 的 on-failure 产物或逐步截图。</p>"""
+
+
+def _render_mobile_evidence_entry(
+    manifest: dict[str, Any], label: str, report_dir: Path | None
+) -> str:
+    path: Path = manifest["_manifestPath"]
+
+    def href(raw: Any) -> str:
+        if not isinstance(raw, str) or not raw.strip():
+            return ""
+        target = Path(raw.strip())
+        if not target.is_absolute():
+            target = path.parent / target
+        if not target.exists():
+            return ""
+        return html.escape(_relative_url(target, report_dir or path.parent))
+
+    shot = href((manifest.get("evidence") or {}).get("screenshot"))
+    tree = href((manifest.get("evidence") or {}).get("viewTree"))
+    log_path = _mobile_log_artifact(manifest)
+    log = href(str(log_path)) if log_path else ""
+    manifest_link = html.escape(_relative_url(path, report_dir or path.parent))
+    run_log = _log_file_name(manifest.get("runLog"))
+    links: list[str] = []
+    if tree:
+        links.append(f'<a href="{tree}">元素树</a>')
+    if shot:
+        links.append(f'<a href="{shot}">截图</a>')
+    if log:
+        links.append(f'<a href="{log}">设备日志</a>')
+    links.append(f'<a href="{manifest_link}">manifest</a>')
+    run_badge = (
+        f'<span class="mono" style="font-size:11px;">{html.escape(run_log)}</span>'
+        if run_log else
+        '<span class="rerun" style="font-size:11px;">未绑定 run 日志</span>'
+    )
+    thumb = (
+        f'<img src="{shot}" alt="{html.escape(str(label))} 截图" '
+        'style="width:100%;border-radius:6px;border:1px solid var(--line,#333);display:block;margin-bottom:8px;">'
+        if shot else
+        '<div style="color:var(--muted);font-size:12px;margin-bottom:8px;">无截图证据</div>'
+    )
+    device = html.escape(str(manifest.get("device") or "-"))
+    duration = manifest.get("durationMs")
+    duration_text = f"{int(duration) / 1000:.1f}s" if isinstance(duration, (int, float)) and not isinstance(duration, bool) else "—"
+    locator = html.escape(str(manifest.get("locator") or "-"))
+    return f"""
+    <div class="card" style="padding:10px;">
+      {thumb}
+      <div class="label" style="font-size:12px;">{html.escape(str(label))}</div>
+      <div style="font-size:12px;line-height:1.7;margin-top:4px;">
+        {" · ".join(links)}<br>
+        设备 {device} · {locator} · {duration_text}<br>
+        run {run_badge}
+      </div>
+    </div>"""
+
+
+def _render_mobile_evidence(
+    readiness_data: dict[str, Any],
+    repo_root: Path | None = None,
+    report_dir: Path | None = None,
+    spec_tasks: dict[str, Any] | None = None,
+) -> str:
     """渲染移动端证据与耗时；没有移动端 task 时不出这一节。"""
     mobile = (readiness_data.get("summary") or {}).get("mobileEvidence") or {}
     if not isinstance(mobile, dict):
@@ -10783,27 +12172,36 @@ def _render_mobile_evidence(readiness_data: dict[str, Any]) -> str:
     if mobile_tasks <= 0:
         return ""
     passed = int(mobile.get("passedMobileTasks", 0) or 0)
-    manifests = int(mobile.get("manifests", 0) or 0)
+    manifests = int(mobile.get("matchedManifests", mobile.get("manifests", 0)) or 0)
     tree = int(mobile.get("locatorTree", 0) or 0)
     screenshot = int(mobile.get("locatorScreenshot", 0) or 0)
     total_ms = int(mobile.get("totalDurationMs", 0) or 0)
     max_ms = int(mobile.get("maxDurationMs", 0) or 0)
+    run_bound = mobile.get("runBoundManifests")
 
     def seconds(value: int) -> str:
         return f"{value / 1000:.1f}s" if value else "—"
 
+    bound_card = (
+        f'<div class="card"><div class="label">绑定本轮 run</div>'
+        f'<div class="value">{int(run_bound)}</div></div>'
+        if isinstance(run_bound, int) and not isinstance(run_bound, bool) else ""
+    )
+    wall = _render_mobile_evidence_wall(repo_root, report_dir, spec_tasks)
+
     return f"""
-<section id="mobile-evidence">
+<section class="block" id="mobile-evidence">
   <h2>移动端 E2E</h2>
   <div class="cards">
     <div class="card"><div class="label">移动端 task</div><div class="value">{mobile_tasks}</div></div>
     <div class="card"><div class="label">已通过</div><div class="value">{passed}</div></div>
-    <div class="card"><div class="label">证据清单</div><div class="value">{manifests}</div></div>
+    <div class="card"><div class="label">有效清单</div><div class="value">{manifests}</div></div>
+    {bound_card}
     <div class="card"><div class="label">累计耗时</div><div class="value">{seconds(total_ms)}</div></div>
     <div class="card"><div class="label">单条最长</div><div class="value">{seconds(max_ms)}</div></div>
     <div class="card"><div class="label">定位方式</div><div class="value">树 {tree} / 截图 {screenshot}</div></div>
   </div>
-  <p style="color:var(--muted);font-size:13px;">截图兜底必须写 fallbackReason；设备日志含崩溃特征时不能判 passed。</p>
+  <p style="color:var(--muted);font-size:13px;">截图兜底必须写 fallbackReason；设备日志含崩溃特征时不能判 passed。</p>{wall}
 </section>"""
 
 
@@ -10928,23 +12326,34 @@ def render_report(args: argparse.Namespace) -> None:
     module = (in_scope[0].get("module") if in_scope else "-") or "-"
     cr_scope_files = _extract_cr_scope_files(cr_data) if cr_data else []
     # 测试脚本列表（从 spec-tasks 的 targetFile / command 提取）
+    # 只列真实存在的文件：blocked task 的 targetFile 可能从未创建，把它算进
+    # 「已交付脚本」会让报告虚报产物。
+    repo_root = Path(getattr(args, "repo", ".")).resolve()
     test_scripts: list[str] = []
+    missing_scripts: list[str] = []
     _seen_scripts: set[str] = set()
     for _t in (spec_tasks_data.get("tasks") or []):
         _tf = str(_t.get("targetFile") or "").strip()
         if _tf.startswith(AGENT_DRIVEN_PREFIX):
             continue  # agent 直驱没有脚本文件，不该出现在「测试脚本」列表里
-        if _tf and _tf not in _seen_scripts:
-            _seen_scripts.add(_tf)
-            test_scripts.append(_tf)
-        elif not _tf:
+        if _tf:
+            _path = Path(_tf) if Path(_tf).is_absolute() else repo_root / _tf
+            if _tf not in _seen_scripts:
+                _seen_scripts.add(_tf)
+                if _path.exists():
+                    test_scripts.append(_tf)
+                elif normalize_task_status(_t.get("implementationStatus")) != "blocked":
+                    missing_scripts.append(_tf)
+        else:
             _m = re.search(r'(e2e/[\w/\-]+\.spec\.ts)', str(_t.get("command") or ""))
             if _m and _m.group(1) not in _seen_scripts:
                 _seen_scripts.add(_m.group(1))
-                test_scripts.append(_m.group(1))
+                if (repo_root / _m.group(1)).exists():
+                    test_scripts.append(_m.group(1))
     scope = {
         "module": html.escape(str(module)),
-        "changes": f"{len(cr_scope_files)} 个源码文件" if cr_scope_files else "—",
+        # cr_scope 是「审查范围」，不一定是产品源码：黑盒项目里它是测试脚本。
+        "changes": f"{len(cr_scope_files)} 个文件" if cr_scope_files else "—",
         "inScopeCases": f"{len(in_scope)} 条",
         "legacy": f"{len(legacy)} 条（缺少执行证据，见 <a href='#appendix-a'>附录 A</a>）" if legacy else "0 条",
     }
@@ -10957,6 +12366,10 @@ def render_report(args: argparse.Namespace) -> None:
     conditions_html = [html.escape(str(c)) for c in conditions]
 
     title = args.title or cases_data.get("metadata", {}).get("requirement") or "QA 验收报告"
+    # 报告里的链接必须能点开：runs/ 与 .qa-agent/ 都在 repo_root 下，
+    # 而报告可能被写到任意位置，所以按 output 反推相对路径。
+    runs_dir = repo_root / ".qa-agent" / "runs"
+    runs_href = _relative_url(runs_dir, output.parent)
 
     parts = [
         '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">',
@@ -10965,11 +12378,12 @@ def render_report(args: argparse.Namespace) -> None:
         _render_header_and_verdict(title, meta, readiness_data, summary_stats),
         _render_evidence_gap(all_cases),
         _render_unverified_cases(all_cases, spec_tasks_data),
-        _render_executive_summary(scope, assertions, conditions_html, cr_notes, cr_next_steps, _render_gates(readiness_data, completion_data, cr_data), test_scripts, cr_scope_files, qa_fix_files),
-        _render_mobile_evidence(readiness_data),
+        _render_executive_summary(scope, assertions, conditions_html, cr_notes, cr_next_steps, _render_gates(readiness_data, completion_data, cr_data), test_scripts, cr_scope_files, qa_fix_files, missing_scripts),
+        _render_mobile_evidence(readiness_data, repo_root=repo_root,
+                                report_dir=output.parent, spec_tasks=spec_tasks_data),
         _render_code_review(cr_data, cr_scope_files),
         _render_risk(risk_data, project_risk_coverage(cases_data)),
-        _render_case_matrix(in_scope, run_data, spec_tasks_data),
+        _render_case_matrix(in_scope, run_data, spec_tasks_data, runs_href=runs_href),
         _render_appendix(legacy, scope_ledger, env_checks, meta),
         '<footer style="margin-top:60px;padding-top:20px;border-top:1px solid var(--line);color:var(--muted);font-size:12px;text-align:center;">',
         f'QA Agent · quality-assurance-agent · 报告 hash <code>{html.escape(fingerprint[:10])}…</code></footer>',
@@ -11861,6 +13275,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--verify-mysql-mcp", action="store_true", help="初始化后短暂启动 mysql_mcp 以验证数据库连通性")
     p.add_argument("--mysql-mcp-timeout", type=int, default=12, help="--verify-mysql-mcp 的连接超时秒数（默认 12）")
     p.add_argument("--skip-playwright-runtime", action="store_true", help="初始化时不自动安装 Playwright 运行时（@playwright/test + 浏览器）")
+    p.add_argument(
+        "--profile",
+        choices=["auto", "mobile"],
+        default="auto",
+        help="mobile：无源码黑盒移动端，跳过 Playwright/服务栈骨架，只建 QA 目录与配置",
+    )
     p.add_argument("--json", help="可选的初始化摘要 JSON 输出路径")
     p.set_defaults(func=init_project)
 
@@ -11920,6 +13340,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--commit")
     p.add_argument("--output", default=".qa-agent/current/context.json")
     p.add_argument("--doc-limit", type=int, default=12000)
+    p.add_argument(
+        "--allow-non-git",
+        action="store_true",
+        help="工作区没有 .git 时（如纯移动端/黑盒验收）仍产出最小上下文，git 字段留空并标注 non-git",
+    )
     p.set_defaults(func=collect_context)
 
     p = sub.add_parser("validate-cases", help="validate test-cases.json")
@@ -11986,6 +13411,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--context")
     p.add_argument("--existing-index")
     p.add_argument("--module", help="逗号分隔的模块路径（如 src/main/java/.../service/impl/OpenBoxServiceImpl.java），限定风险扫描范围；未指定时回退至 git diff，无 diff 时扫描全仓库")
+    p.add_argument(
+        "--surface",
+        choices=["code", "mobile"],
+        default="code",
+        help="mobile：无源码黑盒移动端，输出移动端风险骨架而非关键词扫描结果",
+    )
     p.add_argument("--output", default=".qa-agent/current/risk-analysis.json")
     p.set_defaults(func=analyze_risks)
 
@@ -11993,8 +13424,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--cases", required=True)
     p.add_argument("--repo", default=".")
     p.add_argument("--output", default=".qa-agent/current/test-spec-tasks.json")
-    p.add_argument("--ratio", default="unit=0.60,integration=0.20,api=0.15,e2e=0.05")
-    p.add_argument("--min-specs-by-priority", default="P0=8,P1=5,P2=3,P3=1")
+    p.add_argument("--profile", choices=["development", "mobile-e2e"], default="development",
+                   help="mobile-e2e：只生成 e2e、platform=android-real、脚本路径留给实现阶段")
+    p.add_argument("--ratio", default=None,
+                   help="目标配比；mobile-e2e 默认 unit=0,integration=0,api=0,e2e=1")
+    p.add_argument("--min-specs-by-priority", default=None,
+                   help="每优先级最小 task 数；mobile-e2e 默认每级 1 条")
     p.add_argument("--max-e2e-per-case", type=int, default=2)
     p.set_defaults(func=generate_spec_tasks)
 
@@ -12004,6 +13439,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ratio", default=None, help="目标配比；默认读 spec-tasks 的 targetRatio")
     p.add_argument("--min-specs-by-priority", default=None, help="每优先级最小 task 数；默认读 spec-tasks 的 minSpecsByPriority")
     p.add_argument("--tolerance", type=float, default=0.15)
+    p.add_argument(
+        "--profile",
+        choices=["development", "mobile"],
+        default="development",
+        help="mobile：e2e 100%%、每优先级最少 1 条，且不判 e2e 过重（无源码移动端没有其他层可写）",
+    )
     p.add_argument("--strict", action="store_true")
     p.set_defaults(func=coverage_balance)
 
@@ -12028,7 +13469,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--allow-deferred", action="store_true", help="allow deferred tasks only when blocker/evidence/owner/nextAction are present")
     p.add_argument("--allow-skipped", action="store_true", help="allow skipped tasks only when blocker/evidence/owner/nextAction are present")
     p.add_argument("--fail-on-failed", action="store_true", help="also fail when a task executed and failed; without this, failures mean complete but not ready")
-    p.add_argument("--min-specs-by-priority", default="P0=8,P1=5,P2=3,P3=1", help="minimum task count per enforced case priority")
+    p.add_argument("--min-specs-by-priority", default=None,
+                   help="minimum task count per enforced case priority; 缺省按 spec-tasks 的 "
+                        "minSpecsByPriority / generationProfile 决定（mobile-e2e 每级 1，其余 P0=8/P1=5）")
     p.set_defaults(func=assert_completion)
 
     p = sub.add_parser("assert-code-review", help="fail if code review is missing or has unresolved blocking findings")
@@ -12063,6 +13506,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("assert-mobile-evidence", help="fail when a passed mobile task lacks view tree / screenshot / logcat evidence")
     p.add_argument("--repo", default=".", help="仓库根目录（证据清单从 .qa-agent/runs 下扫描）")
     p.add_argument("--spec-tasks", help="test-spec-tasks.json 路径")
+    p.add_argument("--run", help="latest-run.json 路径（给了就要求证据绑定本轮执行）")
     p.add_argument("--output", default=".qa-agent/current/mobile-evidence-check.json")
     p.set_defaults(func=assert_mobile_evidence)
 
@@ -12196,7 +13640,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--repo", default=".")
     p.add_argument("--timeout", type=int, default=600)
     p.add_argument("--no-adb", action="store_true", help="跳过 Android Platform Tools 安装")
-    p.add_argument("--with-mobilewright", action="store_true", help="一并安装 @mobilewright/test")
+    p.add_argument("--with-mobilewright", action="store_true",
+                   help="安装 mobilewright + @mobilewright/test，并生成 mobilewright.config.ts")
+    p.add_argument("--bundle-id", default="", help="被测应用包名（写入 mobilewright.config.ts）")
+    p.add_argument("--device", default="", help="设备 serial（写入 mobilewright.config.ts 的 deviceId）")
     p.add_argument("--with-ios", action="store_true",
                    help="输出 iOS（Xcode）的人工准备步骤；Xcode 无法自动安装")
     p.add_argument("--add-to-path", action="store_true",
@@ -12234,6 +13681,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=atomic_commit)
 
     p = sub.add_parser("render-report", help="render self-contained HTML report")
+    p.add_argument("--repo", default=".", help="仓库根目录（用于判断 targetFile 是否真实存在）")
     p.add_argument("--cases")
     p.add_argument("--run")
     p.add_argument("--review")
@@ -12244,10 +13692,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--readiness-check", help="readiness-check.json from assert-readiness")
     p.add_argument("--output", default=".qa-agent/reports/latest-report.html")
     p.add_argument("--title")
-    # 归档副本功能（见 render_report 尾部的「方案 A」）一直没被接出来：
-    # 实现里用 getattr(args, "module"/"run_type") 取值，而这两个参数从未注册，
-    # 所以永远取到 None——文档里写的「渲染时通过 --module --run-type 自动生成归档副本」
-    # 实际不生效，使用者只能自己 cp。
+    # 归档副本（render_report 尾部的「方案 A」）：这两个参数曾长期没注册，
+    # 实现里 getattr 永远取到 None，文档写的「自动生成归档副本」实际不生效。
     p.add_argument("--module", help="模块名；与 --run-type 一起给出时额外输出归档副本 {module}-{runType}-{时间戳}.html")
     p.add_argument("--run-type", dest="run_type", help="运行类型（如 acceptance / regression）")
     p.add_argument("--allow-mojibake", action="store_true", help="do not fail if rendered HTML contains known raw mojibake evidence")
@@ -12305,7 +13751,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--case-ids", help="一次执行覆盖的多条用例 ID（逗号分隔）。一个套件跑多条用例时必填，否则只有首条会被算作有执行记录")
     p.add_argument("--task-id", help="spec-task ID（如 SPEC-TC-P0-001-API-001），写入 sidecar")
     p.add_argument("--dry-run", action="store_true", help="仅打印命令不执行")
-    p.add_argument("--timeout", type=int, default=120, help="超时秒数")
+    p.add_argument("--mobile", action="store_true",
+                   help="移动端脚本：默认超时 300s（e2e-mobile 路径也会自动识别）")
+    p.add_argument("--timeout", type=int, default=None, help="超时秒数（默认 120；移动端 300）")
     p.set_defaults(func=run_with_env)
 
     p = sub.add_parser("run-e2e", help="在 playwrightDir 执行 npx playwright test <spec> 并写 run 证据（log+sidecar）")
@@ -12325,7 +13773,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--case-id", help="用例 ID，写入 sidecar；缺省从 spec 文件名推断")
     p.add_argument("--task-id", help="spec-task ID，写入 sidecar")
     p.add_argument("--project", default="android", help="Mobilewright project（默认 android）")
-    p.add_argument("--timeout", type=int, default=300, help="超时秒数")
+    p.add_argument("--device", default="", help="设备 serial；缺省自动识别唯一已授权设备")
+    p.add_argument("--app-package", default="", help="被测应用包名；提供后执行完抓取元素树/截图/logcat 并写 manifest")
+    p.add_argument("--evidence", dest="evidence", action="store_true", default=True, help="执行后写移动端证据（默认开启）")
+    p.add_argument("--no-evidence", dest="evidence", action="store_false", help="不写移动端证据，只写 run sidecar")
+    p.add_argument("--retries", type=int, default=None, help="透传 mobilewright --retries")
+    p.add_argument("--test-timeout", type=int, default=240_000,
+                   help="单条测试超时（毫秒，透传 mobilewright --timeout；完整下单流程建议 240000）")
+    p.add_argument("--timeout", type=int, default=None,
+                   help="子进程超时秒数；缺省按 test-timeout×(retries+1)+120 自动计算，显式值偏小时自动放宽")
+    p.add_argument("--evidence-locator", default="tree", choices=MOBILE_LOCATORS,
+                   help="证据清单声明的定位方式（tree / screenshot）；screenshot 必须另写 fallbackReason")
+    p.add_argument("--disable-ime", dest="disable_ime", action="store_true", default=False,
+                   help="执行前禁用全部输入法、结束后恢复（默认不动设备输入法；进程被 kill 时可能留下无键盘）")
     p.set_defaults(func=run_mobile_e2e)
 
     p = sub.add_parser("safe-write-json", help="写入 JSON 文件并立即做编码完整性检查（规避 Write/Edit 工具的中文编码损坏风险）")

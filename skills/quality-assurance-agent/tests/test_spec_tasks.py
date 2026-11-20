@@ -40,6 +40,42 @@ def _minimal_case(case_id="TC-P0-001", priority="P0", **extra) -> dict:
     return base
 
 
+def test_mobile_e2e_profile_generates_mobilewright_specs(qa, tmp_path):
+    """无源码移动端：只生成 e2e，targetFile 指向 Mobilewright spec，命令走 run-mobile-e2e。"""
+    cases = _minimal_cases([_minimal_case()])
+    result = qa.generate_spec_tasks_data(
+        cases, repo=tmp_path,
+        ratio={"unit": 0, "integration": 0, "api": 0, "e2e": 1},
+        min_specs_override="P0=1,P1=1,P2=1,P3=1",
+        generation_profile="mobile-e2e",
+    )
+    assert result["tasks"], "mobile-e2e profile should still produce tasks"
+    for task in result["tasks"]:
+        assert task["layer"] == "e2e"
+        assert task["platform"] == "android-real"
+        assert task["targetFile"].startswith("tests/e2e-mobile/")
+        assert task["targetFile"].endswith(".spec.ts")
+        assert "run-mobile-e2e" in task["command"]
+        assert task["id"] in task["command"]
+        # 包名未知：命令里没有 --app-package，必须由实现阶段补
+        assert "--app-package" not in task["command"]
+        assert task["needsManualCommand"] is True
+
+
+def test_mobile_e2e_profile_uses_app_package_when_known(qa, tmp_path):
+    cases = _minimal_cases([_minimal_case(data={"appPackage": "com.example.app"})])
+    result = qa.generate_spec_tasks_data(
+        cases, repo=tmp_path,
+        ratio={"unit": 0, "integration": 0, "api": 0, "e2e": 1},
+        min_specs_override="P0=1,P1=1,P2=1,P3=1",
+        generation_profile="mobile-e2e",
+    )
+    for task in result["tasks"]:
+        assert task["appPackage"] == "com.example.app"
+        assert "--app-package com.example.app" in task["command"]
+        assert "needsManualCommand" not in task
+
+
 def test_spec_task_oracle_is_structured_object_not_string(qa, tmp_path):
     write(
         tmp_path / "demo-backend" / "pom.xml",

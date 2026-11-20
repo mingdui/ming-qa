@@ -503,16 +503,33 @@ def _run_doctor(qa, repo, json_path, monkeypatch):
 
 
 def test_doctor_blocks_android_toolchain_when_task_exists(qa, tmp_path, monkeypatch):
-    """项目有 Android task 时，adb / 设备 / mobile-mcp 三项都必须是阻断项。
+    """项目有 Android task 时，adb / 设备必须是阻断项；MCP 只在 agent 直驱时阻断。
 
     历史不一致：设备项会阻断，但 adb 项只有显式 flag 才阻断——adb 缺失时
-    设备项被跳过，结果整组都不拦。
+    设备项被跳过，结果整组都不拦。脚本驱动不依赖 mobile-mcp，不能拿注册状态卡人。
     """
     _write_spec_tasks(tmp_path, [{"id": "T1", "layer": "e2e", "platform": "android-real"}])
     checks = _run_doctor(qa, tmp_path, tmp_path / "doctor.json", monkeypatch)
     mobile = {c["name"]: c for c in checks if c["name"].startswith("mobile_")}
-    assert set(mobile) == {"mobile_adb", "mobile_devices", "mobile_mcp"}
-    assert all(c["required"] is True for c in mobile.values())
+    assert set(mobile) == {"mobile_adb", "mobile_devices", "mobile_mcp", "mobile_cli"}
+    # 脚本驱动（targetFile 不是 @agent:mobile-mcp）只需要 adb 与设备；
+    # 注册 MCP / 安装 mobilecli 都是 agent 直驱才需要的前置条件。
+    assert mobile["mobile_adb"]["required"] is True
+    assert mobile["mobile_devices"]["required"] is True
+    assert mobile["mobile_mcp"]["required"] is False
+    assert mobile["mobile_cli"]["required"] is False
+
+
+def test_doctor_requires_mcp_and_mobilecli_for_agent_driven_task(qa, tmp_path, monkeypatch):
+    """agent 直驱（@agent:mobile-mcp）时，mobile-mcp 与 mobilecli 缺失都必须阻断。"""
+    _write_spec_tasks(tmp_path, [{
+        "id": "T1", "layer": "e2e", "platform": "android-real",
+        "targetFile": "@agent:mobile-mcp",
+    }])
+    checks = _run_doctor(qa, tmp_path, tmp_path / "doctor.json", monkeypatch)
+    mobile = {c["name"]: c for c in checks if c["name"].startswith("mobile_")}
+    assert mobile["mobile_mcp"]["required"] is True
+    assert mobile["mobile_cli"]["required"] is True
 
 
 def test_doctor_blocks_ios_explicitly(qa, tmp_path, monkeypatch):
@@ -585,6 +602,18 @@ def test_ios_task_triggers_manual_ios_step_without_flag(qa, tmp_path, monkeypatc
     assert any("Xcode" in item for item in result["manualSteps"])
 
 
+def test_resolve_run_timeout_for_mobile_paths(qa):
+    """完整移动端结算链路实测 ~160s；120s 默认会把正常流程判成超时。"""
+    args = SimpleNamespace(timeout=None, mobile=False)
+    assert qa._resolve_run_timeout(args, Path("tests/e2e-mobile/mydemo/tc.py")) == 300
+    args = SimpleNamespace(timeout=None, mobile=True)
+    assert qa._resolve_run_timeout(args, Path("tests/api/tc.sh")) == 300
+    args = SimpleNamespace(timeout=None, mobile=False)
+    assert qa._resolve_run_timeout(args, Path("tests/api/tc.sh")) == 120
+    args = SimpleNamespace(timeout=42, mobile=True)
+    assert qa._resolve_run_timeout(args, Path("tests/e2e-mobile/tc.py")) == 42
+
+
 # --- ⑫ Mobilewright 回归执行 ---
 
 
@@ -599,7 +628,8 @@ def _mobile_args(tmp_path, spec, **overrides):
     values = dict(
         repo=str(tmp_path), spec=str(spec), project=None,
         case_id="TC-P0-001", task_id="SPEC-TC-P0-001-E2E-001",
-        extra=[], timeout=5,
+        extra=[], timeout=5, device="", app_package="", evidence=False,
+        retries=None,
     )
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -619,9 +649,59 @@ def test_run_mobile_e2e_builds_mobilewright_command(qa, tmp_path, monkeypatch):
 
     qa.run_mobile_e2e(_mobile_args(tmp_path, spec))
 
-    assert seen["cmd"][:5] == ["/usr/bin/npx", "mobilewright", "test", "--project", "android"]
-    assert seen["cmd"][5] == str(spec)
+    assert seen["cmd"][:3] == ["/usr/bin/npx", "mobilewright", "test"]
+    assert seen["cmd"][3] == spec.relative_to(tmp_path).as_posix()
+    assert seen["cmd"][4] == "--project=android"
     assert seen["cwd"] == str(tmp_path)
+
+
+def test_run_mobile_e2e_writes_evidence_when_package_known(qa, tmp_path, monkeypatch):
+    import mobile_adb
+
+    spec = _mobile_spec(tmp_path)
+    seen = {}
+
+    class FakeMobileAdb:
+        def __init__(self, serial=None, adb=None):
+            seen["serial"] = serial
+
+        def save_evidence(self, repo, case_id, task_id, **kwargs):
+            seen["evidence"] = {"case": case_id, "task": task_id, **kwargs}
+
+    monkeypatch.setattr(qa, "find_npx", lambda: "/usr/bin/npx")
+    monkeypatch.setattr(qa.subprocess, "run",
+                        lambda *a, **kw: SimpleNamespace(returncode=0, stdout="PASS", stderr=""))
+    monkeypatch.setattr(qa, "_find_adb", lambda: "adb")
+    monkeypatch.setattr(qa, "_detect_adb_devices", lambda repo: {
+        "available": True, "adbPath": "adb", "devices": ["SER"],
+        "authorized": ["SER"], "unauthorized": [],
+    })
+    monkeypatch.setattr(qa, "_mobile_ime_snapshot", lambda adb, serial: None)
+    monkeypatch.setattr(mobile_adb, "MobileAdb", FakeMobileAdb)
+
+    qa.run_mobile_e2e(_mobile_args(
+        tmp_path, spec, app_package="com.example.app", evidence=True,
+    ))
+
+    assert seen["serial"] == "SER"
+    assert seen["evidence"]["case"] == "TC-P0-001"
+    assert seen["evidence"]["task"] == "SPEC-TC-P0-001-E2E-001"
+    assert seen["evidence"]["scope"] == spec.parent.name
+    assert seen["evidence"]["locator"] == "tree"
+
+
+def test_run_mobile_e2e_no_tests_fails_without_sidecar(qa, tmp_path, monkeypatch):
+    """runner 报 No tests found 时退出码可能是 0；不能记成一次执行。"""
+    spec = _mobile_spec(tmp_path)
+    monkeypatch.setattr(qa, "find_npx", lambda: "/usr/bin/npx")
+    monkeypatch.setattr(qa.subprocess, "run",
+                        lambda *a, **kw: SimpleNamespace(returncode=0, stdout="No tests found.", stderr=""))
+
+    with pytest.raises(SystemExit) as exc:
+        qa.run_mobile_e2e(_mobile_args(tmp_path, spec))
+
+    assert exc.value.code == 2
+    assert not list((tmp_path / ".qa-agent" / "runs").glob("run-*.meta.json"))
 
 
 def test_run_mobile_e2e_records_sidecar(qa, tmp_path, monkeypatch):

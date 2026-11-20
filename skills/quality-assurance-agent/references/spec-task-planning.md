@@ -30,9 +30,10 @@ Each task must include:
 - `sourceCaseId`
 - `priority`
 - `layer`: `unit`, `integration`, `api`, or `e2e`
+- `platform`（缺省 `web`）：`android-real` / `android-emulator` / `ios-sim` / `ios-real`
 - `focus`
 - `targetProject`
-- `targetFile`
+- `targetFile`（`@agent:mobile-mcp` 等 `@` 前缀表示 agent 直驱、没有脚本文件）
 - `testName`
 - `businessActor`
 - `operationPath`
@@ -43,9 +44,23 @@ Each task must include:
 - `executionStatus`
 - `evidence`
 
+`command` / `targetFile` 可以为空，但只在两种情况下成立：`needsManualCommand: true`（generic
+或 mobile-e2e profile，实现阶段必须补齐），或 `targetFile` 以 `@` 开头（agent 直驱，没有脚本文件）。
+`assert-completion` 会拦截「声称通过但 command 为空」的假通过。
+
+## Generation Profiles
+
+| profile | 产物 |
+|---|---|
+| `development`（默认） | 完整金字塔：unit / integration / api / e2e |
+| `mobile-e2e` | 只生成 e2e；`platform=android-real`、`targetFile`/`command` 为空、`needsManualCommand=true` |
+
+`mobile-e2e` 用于无源码黑盒（已安装的 APK）。配套跑 `coverage-balance --profile mobile`：
+目标配比 e2e 100%、每优先级最少 1 条，并且不再判「E2E 过重」。
+
 ## Coverage Rules
 
-- Unit tasks should be the largest group.
+- Unit tasks should be the largest group——**有源码时**。`mobile-e2e` profile 例外：没有 unit 层可写，e2e 占 100%，由 `--profile mobile` 放行。
 - Integration should be fewer than unit but more than E2E.
 - API should cover contracts and authorization without duplicating all E2E flows.
 - E2E should only cover high-risk main flows and a small number of critical branches.

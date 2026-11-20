@@ -23,6 +23,21 @@ def _write(path: Path, content: str):
     path.write_text(content, encoding="utf-8")
 
 
+def test_blocked_task_does_not_require_target_file(qa, tmp_path):
+    """产品缺口导致的 blocked task 不该卡在实现门禁上。"""
+    spec = {"tasks": [{
+        "id": "SPEC-TC-P1-008-E2E-001",
+        "sourceCaseId": "TC-P1-008",
+        "targetFile": "tests/e2e-mobile/demo/tc-p1-008.spec.ts",
+        "layer": "e2e",
+        "implementationStatus": "blocked",
+        "executionStatus": "blocked",
+    }]}
+    result = qa.assert_script_implementation_data(spec, tmp_path)
+    assert result["status"] == "passed"
+    assert result["summary"]["blockedTasks"] == 1
+
+
 def test_target_file_missing_is_not_implemented(qa, tmp_path):
     spec = _spec_tasks(["src/test/java/qa/OpenBoxTest.java"])
     result = qa.assert_script_implementation_data(spec, tmp_path)

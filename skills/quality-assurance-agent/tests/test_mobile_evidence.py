@@ -11,6 +11,7 @@ not-run 各有自己的语义（blocker 证据、失败日志），在这里重�
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -300,6 +301,22 @@ def test_summary_reports_duration(qa, tmp_path):
     assert result["summary"]["totalDurationMs"] == 1200
     assert result["summary"]["maxDurationMs"] == 1200
     assert result["summary"]["locatorTree"] == 1
+    assert result["summary"]["matchedManifests"] == 1
+
+
+def test_summary_uses_latest_manifest_per_task(qa, tmp_path):
+    """重跑会留下多份 manifest；汇总只能取最新一份，不能把重跑开销累加进去。"""
+    old = _write_manifest(tmp_path, run_id="1", case_id="TC-P0-001")
+    _update_manifest(old, durationMs=1000)
+    new = _write_manifest(tmp_path, run_id="2", case_id="TC-P0-001")
+    _update_manifest(new, durationMs=2000)
+    os.utime(old / "manifest.json", (1000, 1000))
+    os.utime(new / "manifest.json", (2000, 2000))
+
+    result = qa.assert_mobile_evidence_data(_spec(_task()), tmp_path)
+    assert result["summary"]["manifests"] == 2
+    assert result["summary"]["matchedManifests"] == 1
+    assert result["summary"]["totalDurationMs"] == 2000
 
 
 # --- ⑤ 设备日志崩溃是 passed 的负向门禁 ---

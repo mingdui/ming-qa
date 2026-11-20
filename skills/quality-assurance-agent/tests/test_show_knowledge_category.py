@@ -3,6 +3,10 @@ import json
 import subprocess
 from pathlib import Path
 
+# 绝对路径定位 CLI：写成 "scripts/qa_agent.py" 只有 cwd 在技能目录下才跑得通，
+# 从仓库根跑 pytest 会直接报 No such file。
+AGENT = Path(__file__).resolve().parent.parent / "scripts" / "qa_agent.py"
+
 
 def test_show_knowledge_category_filter(tmp_path):
     """验证 show-knowledge --category 能正确过滤"""
@@ -30,7 +34,7 @@ def test_show_knowledge_category_filter(tmp_path):
 
     # 测试不带 --category：应返回所有记录
     result = subprocess.run(
-        ["python", "scripts/qa_agent.py", "show-knowledge", "--repo", str(tmp_path)],
+        ["python", str(AGENT), "show-knowledge", "--repo", str(tmp_path)],
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -42,7 +46,7 @@ def test_show_knowledge_category_filter(tmp_path):
 
     # 测试 --category bug-pattern：应只返回 bug-pattern
     result = subprocess.run(
-        ["python", "scripts/qa_agent.py", "show-knowledge", "--repo", str(tmp_path), "--category", "bug-pattern"],
+        ["python", str(AGENT), "show-knowledge", "--repo", str(tmp_path), "--category", "bug-pattern"],
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -55,7 +59,7 @@ def test_show_knowledge_category_filter(tmp_path):
 
     # 测试 --category api-quirk：应只返回 api-quirk
     result = subprocess.run(
-        ["python", "scripts/qa_agent.py", "show-knowledge", "--repo", str(tmp_path), "--category", "api-quirk"],
+        ["python", str(AGENT), "show-knowledge", "--repo", str(tmp_path), "--category", "api-quirk"],
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -68,7 +72,7 @@ def test_show_knowledge_category_filter(tmp_path):
 
     # 测试不存在的 category
     result = subprocess.run(
-        ["python", "scripts/qa_agent.py", "show-knowledge", "--repo", str(tmp_path), "--category", "nonexistent"],
+        ["python", str(AGENT), "show-knowledge", "--repo", str(tmp_path), "--category", "nonexistent"],
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -93,7 +97,7 @@ def test_show_knowledge_module_and_category(tmp_path):
     # 测试 --module module-a --category bug-pattern
     result = subprocess.run(
         [
-            "python", "scripts/qa_agent.py", "show-knowledge",
+            "python", str(AGENT), "show-knowledge",
             "--repo", str(tmp_path),
             "--module", "module-a",
             "--category", "bug-pattern",

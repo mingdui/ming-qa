@@ -51,8 +51,12 @@ Windows / Linux 上只会出现失败的 `mobile_ios_host`，不会去执行任�
 python "$QA_AGENT_DIR/scripts/qa_agent.py" install-mobile-e2e --repo .
 ```
 
-它做三件事（幂等）：注册 mobile-mcp 到 `.mcp.json`、安装 Android Platform Tools、（加
-`--with-mobilewright` 时）安装 `@mobilewright/test`。
+它做四件事（幂等）：注册 mobile-mcp 到 `.mcp.json`、安装 Android Platform Tools、验证
+`mobilecli` 是否存在并枚举已授权设备、（加 `--with-mobilewright` 时）安装 `@mobilewright/test`。
+
+`mobilecli` 缺失只报 `manual`，不判失败：脚本驱动（`mobile_adb.py`）不需要它，
+只有 agent 直驱（`task.targetFile = "@agent:mobile-mcp"`）才必须修好。`doctor` 的
+`mobile_cli` 检查项同样按这个条件决定是否 `required`。
 
 adb 的装法：优先用平台包管理器（winget / brew / apt）；**都没有时回退到 Google 官方 CDN
 下载 zip 到 `~/.ming-qa/platform-tools/`**——Windows 10 LTSC 默认没有 winget，走的就是这条回退。
@@ -119,9 +123,74 @@ claude mcp add mobile-mcp -- npx -y @mobilenext/mobile-mcp@latest
 
 重启 agent 会话后，`mobile_list_available_devices` 应可用。
 
-## 方式 ②：mobile-mcp 直驱（默认）
+## 无源码 / 黑盒项目（被测对象是已安装的 APK）
 
-日常执行与调试走这条路径。agent 通过 MCP 工具操作设备：
+仓库里没有源码、没有 `pom.xml`/`package.json`、甚至没有 `.git` 时，按下面一组 profile 跑，
+**不要**硬套有源码项目的流程：
+
+```bash
+# 1. 初始化：跳过 Playwright / 服务栈骨架
+python "$QA_AGENT_DIR/scripts/qa_agent.py" init-project --repo . --profile mobile
+
+# 2. 上下文：无 git 也产出最小上下文，git 字段留空并标注 non-git
+python "$QA_AGENT_DIR/scripts/qa_agent.py" collect-context --repo . --allow-non-git \
+  --output .qa-agent/current/context.json
+
+# 3. 风险：不做关键词扫描，输出移动端风险骨架（需结合真机证据落地）
+python "$QA_AGENT_DIR/scripts/qa_agent.py" analyze-risks --repo . --surface mobile \
+  --output .qa-agent/current/risk-analysis.json
+
+# 4. 任务：只生成 e2e，platform=android-real，targetFile/command 留给实现阶段
+python "$QA_AGENT_DIR/scripts/qa_agent.py" generate-spec-tasks \
+  --cases .qa-agent/current/test-cases.json --repo . --profile mobile-e2e \
+  --output .qa-agent/current/test-spec-tasks.json
+python "$QA_AGENT_DIR/scripts/qa_agent.py" coverage-balance \
+  --spec-tasks .qa-agent/current/test-spec-tasks.json --profile mobile \
+  --output .qa-agent/current/coverage-balance.json --strict
+```
+
+`coverage-balance --profile mobile` 的目标配比是 e2e 100%、每优先级最少 1 条，并且不再判
+「e2e 过重」——无源码移动端没有 unit/integration/api 层可写，那层告警在这里是纯噪音。
+
+### 内置 adb 驱动 `mobile_adb.py`
+
+`skills/quality-assurance-agent/scripts/mobile_adb.py` 是零依赖的确定性驱动，封装了真机上
+踩过的坑（中文输入法拦截 `input text`、文本节点不可点击、`pm clear` 被拒、多设备歧义）：
+
+```python
+import os, sys
+sys.path.insert(0, os.path.join(os.environ["QA_AGENT_DIR"], "scripts"))
+from mobile_adb import MobileAdb
+
+device = MobileAdb()                 # 必须恰好一台已授权设备，否则报错
+device.launch("com.example.app")
+device.tap(text="Add to cart")       # 自动找最近的 clickable 祖先
+device.type_text("user@example.com", rid="email")  # 仅本次调用禁用/恢复输入法
+device.check("terms")                # 左边缘点击 + checked 校验 + 中心点回退
+device.reset_state("com.example.app", reset_menu_item="Reset App State",
+                   reset_confirm="RESET APP", reset_ok="OK")  # pm clear 被拒时的降级链
+device.save_evidence(repo, "TC-1", "SPEC-1", locator="tree", duration_ms=1234)
+```
+
+`save_evidence` 直接写 `view-tree.xml` / `screen.png` / `logcat.txt` / `manifest.json`，
+与 `assert-mobile-evidence` 的契约一致。
+
+## 方式 ②：mobile-mcp 直驱（agent 直驱，需重启会话）
+
+**不是本仓库的默认执行通道。** 只有 spec-task 的 `targetFile` 写成 `@agent:mobile-mcp`
+时，agent 才通过 MCP 工具操作设备；此时 `doctor` 的 `mobile_mcp` / `mobile_cli` 才是阻断项。
+
+> **三条通道是并列的，不是自动的「首次 → 回归」流水线。**
+> ming-qa 没有「录制 mobile-mcp 操作并自动转成 Mobilewright spec」的能力，也没有把
+> 脚本运行转成 spec 的能力。所谓「跑通以后沉淀成 Mobilewright」是 agent/人**显式**写脚本的
+> 动作，不是工具保证的行为。选择哪条通道只看 spec-task 的 `targetFile` 写法。
+
+要启用它：先把 mobile-mcp 注册进 `.mcp.json`（`install-mobile-e2e` 会做），然后**重启 agent
+会话**——MCP server 在会话启动时加载，注册后当前会话不会自动出现 `mobile_*` 工具。这也是
+demo 真机执行时没有用上 mobile-mcp 的直接原因：会话里根本没有这组工具，执行通道降级为
+脚本驱动的 adb（见上一节 `mobile_adb.py`）。
+
+agent 通过 MCP 工具操作设备：
 
 ```
 mobile_list_available_devices      # 确认目标设备
@@ -148,7 +217,26 @@ mobile_get_device_logs             # 崩溃 / 异常取证
 
 **必须显式指定目标设备**，不允许静默选取第一台。静默选取会让测试结果不可复现，且出问题时极难排查。
 
-## 方式 ③：@mobilewright/test（沉淀资产）
+## 方式 ③：Mobilewright 回归（推荐作为后续每一次）
+
+**这是回归层的默认选择**：探索阶段（mobile-mcp / adb）确认流程后，把稳定流程写成
+Mobilewright spec，之后每次回归直接跑 spec，无 LLM 在环。完整的安装、配置、真机坑
+和证据链见 `references/mobilewright-regression.md`。
+
+```bash
+npm install --save-dev mobilewright @mobilewright/test
+npx mobilewright doctor --category android
+npx mobilewright test tests/e2e-mobile/<module> --project=android
+```
+
+或者用 ming-qa 封装（会顺带写 run sidecar 和移动端证据）：
+
+```bash
+python "$QA_AGENT_DIR/scripts/qa_agent.py" run-mobile-e2e \
+  --repo . --spec tests/e2e-mobile/<module>/<case-id>.spec.ts \
+  --case-id TC-P0-001 --task-id SPEC-TC-P0-001-E2E-001 \
+  --app-package <bundle-id> --project android
+```
 
 用于沉淀可回归的测试蓝图：
 

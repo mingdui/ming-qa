@@ -80,10 +80,12 @@ Both are configured in [docs/configuration.md](docs/configuration.md).
 
 ## Requirements
 
-- Python 3.9+ (stdlib only — no third-party runtime dependencies)
+- Python 3.9+. The tool itself is **stdlib only** — nothing to `pip install`
 - Git
 - Target project: Maven or Node.js/npm; other types (Python, Go, Gradle, etc.) are accommodated by the AI during execution
-- E2E tests are Playwright-based and cover the Web, plus Android real devices and emulators (via Mobilewright / mobile-mcp, with view tree + screenshot + device log evidence); iOS detection and evidence contracts are wired in, but require macOS + Xcode and remain untested
+- E2E tests are Playwright-based and cover the Web, plus Android real devices and emulators: script-driven tests use the built-in `mobile_adb.py` (plain adb, no MCP required), agent-driven tests use mobile-mcp, and asset-based tests use Mobilewright; all share view tree + screenshot + device log evidence. iOS detection and evidence contracts are wired in, but require macOS + Xcode and remain untested
+- The mobile path calls **external tools** through `npx`; they are not Python dependencies: `mobilewright` (runs `.spec.ts` regression suites), `mobile-mcp` (agent-driven device control), `adb` (used by `mobile_adb.py` and evidence capture). Missing one only disables that capability
+- When the target has **no source code** (an installed APK/IPA), use `init-project --profile mobile` for the black-box path. It can prove a flow works on a real device, but there is no code review, so it cannot prove implementation quality
 
 ## Troubleshooting
 

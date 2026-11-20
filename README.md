@@ -82,10 +82,12 @@ agent 会自动初始化项目、体检环境、按验收范围装好需要的�
 
 ## 系统要求
 
-- Python 3.9+（仅用标准库，无第三方运行时依赖）
+- Python 3.9+。**工具自身**只用标准库，没有需要 `pip install` 的运行时依赖
 - Git
 - 目标项目：Maven 或 Node.js/npm，其他类型（Python、Go、Gradle 等）AI 执行过程可自动兼容
-- E2E 测试基于 Playwright 覆盖 Web，并支持 Android 真机 / 模拟器（基于 Mobilewright / mobile-mcp，证据链为元素树 + 截图 + 设备日志）；iOS 已接入检测与证据契约，但需要 macOS + Xcode，尚未实测
+- E2E 测试基于 Playwright 覆盖 Web，并支持 Android 真机 / 模拟器：脚本驱动用内置 `mobile_adb.py`（adb 直连，不依赖 MCP），agent 直驱走 mobile-mcp，沉淀资产走 Mobilewright；证据链为元素树 + 截图 + 设备日志。iOS 已接入检测与证据契约，但需要 macOS + Xcode，尚未实测
+- 移动端这条链路会用到**外部工具**，它们不在 Python 依赖里，按需通过 `npx` 调起：`mobilewright`（跑 `.spec.ts` 回归）、`mobile-mcp`（agent 直接驱动设备）、`adb`（`mobile_adb.py` 与证据采集）。缺哪个，对应能力就不可用，其余流程照常
+- 被测对象**没有源码**时（已安装的 APK/IPA）：用 `init-project --profile mobile` 走黑盒路径。该模式只能证明「真机上这条流程走得通」，没有代码审查，不能证明实现质量
 
 ## 遇到问题
 

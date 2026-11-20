@@ -40,6 +40,9 @@ description: >
 如果 `.qa-agent/config`、`.qa-agent/cases`、`.qa-agent/local`、`.qa-agent/current` 任一目录缺失，先跑 `init-project --repo .`。
 不要假设目录已经在——检查后再决定。
 
+**无源码黑盒验收**（被测对象是已安装的 APK/IPA，仓库没有源码）用 `init-project --repo . --profile mobile`：
+跳过 Playwright 模板/运行时和本地服务栈骨架，只建 QA 目录与配置。
+
 ### 3. 加载项目经验
 
 运行 `show-knowledge` 加载两类经验：
@@ -60,6 +63,7 @@ python "$QA_AGENT_DIR/scripts/qa_agent.py"show-knowledge --repo . --module agen
 - 验收指定模块：用 `--scope uncommitted`（即使 diff 为空，收集模式会 fallback 到 git status）
 - 验收当前改动：用 `--scope uncommitted`
 - 如果 collect-context 的 module scope 报 `rg`（ripgrep）缺失错误：改用 `--scope uncommitted` + 手动用 Grep 工具补全代码文件
+- 工作区没有 `.git`（黑盒/移动端验收）：加 `--allow-non-git`，产出 `gitAvailable: false`、`scope.mode: "non-git"` 的最小上下文；git diff 字段留空，不要编造变更文件
 - 输出到 `.qa-agent/current/context.json`
 
 **特别注意**：`collect-context` 只抓元数据和文件列表，不会深度读取代码。你需要**自己动手**读 context 里列出的目标模块文件——Controller、Service、DTO、前端页面、service 层——理解完整的代码链路。这一步不做，后续风险分析会缺失关键细节。

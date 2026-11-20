@@ -20,6 +20,13 @@ def test_verdict_badge_color_by_action(qa):
     assert "已排除" in qa._verdict_badge("REJECTED")
 
 
+def test_verdict_badge_empty_renders_dash_not_question_mark(qa):
+    html = qa._verdict_badge("")
+    assert 'class="b mute"' in html
+    assert "—" in html
+    assert "?" not in html
+
+
 def test_verdict_badge_unknown_falls_back(qa):
     html = qa._verdict_badge("weird")
     assert 'class="b info"' in html

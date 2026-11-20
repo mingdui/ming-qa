@@ -37,6 +37,7 @@ description: >
 - **验收已有模块**：**必须带 --module**，逗号分隔列出目标代码文件（绝对路径、相对路径、目录路径或 glob）。这样 `affectedFiles` 只包含你真正关心的代码，不会混入全仓库 160 个无关文件。
 - **开发新功能、有 git diff**：不带 --module，工具会自动从 git diff 提取变更文件。
 - **裸跑（不带 --module 且无 diff）**：工具回退到全仓库关键词扫描，结果中 `businessPath` 全是"待映射到业务操作路径"，`affectedFiles` 包含大量 skill/doc/config 文件——**这种情况产出的 risk-analysis.json 不能直接使用**，必须手工重写。
+- **无源码移动端（黑盒 APK/IPA）**：用 `analyze-risks --surface mobile`。不做关键词扫描——没有源码可扫，硬扫只会产出与业务无关的噪音；工具输出移动端风险骨架（状态残留、金额一致、越权、负向路径、跨页同步），每条 `requiresE2E: true`、`affectedFiles: []`，并在 `summary.note` 标注无源码边界。骨架**不替代业务分析**：`businessPath` 仍需你按真机流程改写，覆盖结论必须来自真机证据。
 
 ## 工作流
 

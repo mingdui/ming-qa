@@ -54,7 +54,11 @@ description: >
 - 需要数据库验证的 integration 层：先读取 `$QA_AGENT_DIR/references/mysql-mcp-integration.md` 了解查库方法，跑脚本后**按 `oracle.db` 结构化逐条校验**，记录「查询摘要 + 期望 + 实际 + 状态」到 evidence
 - `verificationMode: direct-db` 的数据完整性 task：直接通过 MySQL MCP `read_query` 执行 `oracle.db[].query`，逐条断言，不允许降级为「手工核对通过」
 - e2e 层：先读取 `$QA_AGENT_DIR/references/playwright-agent-integration.md` 了解 Playwright 规划器/生成器/修复器流程，通过 Playwright MCP 真实浏览器操作（navigate → login → click → snapshot → network_requests）
-- 移动端 e2e 层（`platform: android-real` / `android-emulator` / `ios-sim` / `ios-real`）：先读取 `$QA_AGENT_DIR/references/mobile-e2e-integration.md` 确认宿主环境与平台限制，再选择 mobile-mcp 直驱（日常执行）或 `@mobilewright/test`（沉淀资产）。回归执行走 `qa_agent.py run-mobile-e2e`，与首次执行写同构的 run sidecar
+- 移动端 e2e 层（`platform: android-real` / `android-emulator` / `ios-sim` / `ios-real`）：先读取 `$QA_AGENT_DIR/references/mobile-e2e-integration.md` 确认宿主环境与平台限制，再按 `targetFile` 选择通道：
+  - 普通脚本路径（如 `tests/e2e-mobile/.../tc_*.py`）→ **脚本驱动**，用 `qa_agent.py` 自带的 `mobile_adb.py`，只依赖 adb，不要求 MCP
+  - `@agent:mobile-mcp` → **agent 直驱**，需要当前会话已加载 mobile-mcp（注册后必须重启会话），且 `mobilecli` 可用
+  - `tests/e2e-mobile/<module>/*.spec.ts` → **Mobilewright 回归**（推荐作为后续每一次），走 `qa_agent.py run-mobile-e2e --app-package <包名>`；它会写 sidecar 和移动端证据。完整坑位见 `$QA_AGENT_DIR/references/mobilewright-regression.md`
+  三者的证据契约相同，都要写同构的 run sidecar
 - 移动端 task 标记 `passed` 前，必须把三类证据落到 `.qa-agent/runs/<run-id>/mobile/<scope>/` 并写 `manifest.json`：`caseId`、`device`、`locator`（`tree` / `screenshot`）、`durationMs`、`viewTree`、`screenshot`、设备日志（Android 用 `logcat`，iOS 用 `deviceLog` / `syslog`）。用截图兜底时还必须写 `fallbackReason`。`assert-evidence-integrity` 会校验；缺任何一类、缺耗时、缺降级原因，最终报告都不能通过
 - 移动端 task 的每条 oracle 断言都要在 `evidenceRefs` 里标明由哪类证据支撑（`viewTree` / `screenshot` / `logcat`），否则 `assert-evidence-integrity` 报 `mobile-assertion-without-evidence`
 - 设备日志里出现 `FATAL EXCEPTION` / `ANR in` / `E/AndroidRuntime` / iOS uncaught exception 等崩溃特征时，task **不能**标 `passed`；门禁会直接判失败

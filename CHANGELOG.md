@@ -36,6 +36,66 @@
 - run sidecar 新增 `durationMs`，`aggregate-runs` 同步聚合耗时
 - `doctor` 的 `mobile_adb` / `mobile_devices` / `mobile_mcp` 在项目存在 Android task 时
   统一为阻断项，修正此前「设备项阻断、adb 项不阻断」的不一致
+- 无源码移动端（黑盒 APK/IPA）工作流：`init-project --profile mobile`（跳过 Playwright/服务栈）、
+  `collect-context --allow-non-git`（无 `.git` 时产出最小上下文并标注 non-git）、
+  `analyze-risks --surface mobile`（输出移动端风险骨架而非关键词噪音）、
+  `generate-spec-tasks --profile mobile-e2e`（只出 e2e，路径/命令留给实现阶段）、
+  `coverage-balance --profile mobile`（e2e 100%、每级最少 1 条，不判 e2e 过重）
+- 新增 `scripts/mobile_adb.py`：零依赖 ADB 驱动，封装中文输入法拦截、不可点击文本节点、
+  `pm clear` 被拒后的降级链、多设备歧义；`save_evidence` 直接产出证据契约要求的四件套
+- `install-mobile-e2e` 新增 `mobilecli` 与已授权设备发现步骤；`doctor` 新增 `mobile_cli`
+  检查项——仅在 task 由 agent 直驱（`targetFile: "@agent:mobile-mcp"`）时阻断，脚本驱动不要求
+- `doctor` 的 `mobile_mcp` 同样改为条件阻断：脚本驱动（`mobile_adb.py`）不再被迫注册
+  mobile-mcp；只有 `@agent:mobile-mcp` 直驱时才要求注册并重启会话
+- `doctor --ignore` 的豁免写入 `environment-checks.json`（`ignored: true` + `ignoreReason`，
+  `status` 仍为 `blocked`），控制台标 `[WAIVED]`，报告不再把「知情放行」写成「已修复」
+- `run-with-env` 新增 `--mobile` 与 `--timeout`：移动端 e2e 默认 300s，避免完整结算流程
+  被 120s 默认超时截断
+- **Mobilewright 成为移动端回归主引擎**：`generate-spec-tasks --profile mobile-e2e` 直接生成
+  `tests/e2e-mobile/<module>/<case>.spec.ts` 与 `run-mobile-e2e` 命令；`install-mobile-e2e
+  --with-mobilewright --bundle-id <包名>` 安装 `mobilewright` + `@mobilewright/test` 并生成
+  `mobilewright.config.ts`；`doctor` 新增 `mobilewright_runtime`，`mobile_cli` 认项目内自带二进制
+- `run-mobile-e2e` 补齐真机执行细节：修正 `--project=` 参数顺序、相对 POSIX spec 路径、
+  测试级 `--test-timeout`（完整下单流程 240s）、执行前后禁用/恢复中文输入法、
+  `--app-package` 后自动写元素树/截图/按 PID 过滤的 logcat 证据
+- 新增 `references/mobilewright-regression.md`：记录 fill() 焦点竞争、IME 拦截、
+  `clearData` 在 ColorOS 被拒、整机 logcat 误报等真机坑与处理方式
+- `assert-script-implementation` 跳过已标记 blocked 的 task：产品缺口（如没有订单历史入口）
+  不应被当成「脚本未实现」
+
+### Changed
+
+- **移动端证据必须绑定本轮执行**：`manifest.json` 新增 `runLog`（指向本次 sidecar 日志）、
+  `captureWindow`（当前固定 `post-run`，说明是测试结束后的终态快照）、`capturedAt`，以及可选的
+  `startedAt` / `finishedAt` / `package`。`assert-evidence-integrity --run <latest-run.json>` 会要求
+  `runLog` 出现在本轮 `cases[].attempts[].logFile` 里，否则判 `mobile-evidence-run-unbound`。
+  **升级后旧产物会变红**：证据要用新版 `run-mobile-e2e` 重跑一次才会带上 `runLog`；
+  暂时不想重跑时别传 `--run`，或单独跑 `assert-mobile-evidence`（不传 `--run` 时不做绑定检查）
+- `assert-completion` 的 `--min-specs-by-priority` 默认改为「不传」：不传时依次读 spec-tasks 根级的
+  `minSpecsByPriority`、`generationProfile == "mobile-e2e"` 的每级 1 条、再回落到桌面默认 8/5/3/1。
+  此前生成端写 1 条、校验端按 8 条判，同一份产物换个人重跑结论会翻转
+- `run-mobile-e2e --timeout` 默认改为自动：按 `--test-timeout × (retries+1) + 120s` 计算；
+  显式给的秒数小于这个最坏耗时时打一行提示并放宽，不再让测试跑一半被自家超时砍掉
+- `run-mobile-e2e` 不再整轮禁用输入法：默认沿用 `mobile_adb.py` 的按次禁用/恢复，
+  整轮禁用降级为显式开关 `--disable-ime`（配 atexit 兜底）。整轮禁用曾在 subprocess 被强杀时
+  把设备留成没键盘的状态
+- 报告的证据变成可点的：case 矩阵的执行日志、移动端证据墙的元素树 / 截图 / 设备日志 / manifest
+  都是相对链接，证据墙直接嵌截图缩略图；未绑定 run 的清单会标注出来
+- `README` 的依赖表述区分「工具自身零依赖」与「移动端可选外部工具（npx 调起）」
+
+### Fixed
+
+- 修复「跑挂了却写成通过」不拦：`assert-evidence-integrity` 现在比对 run 的 `finalOutcome` 与
+  task 的 `executionStatus`，不一致报 `run-task-outcome-mismatch`
+- 修复移动端断言映射形同盖章：`evidenceRefs` 里声明的证据类必须真的在 manifest 里采到
+  （`mobile-evidence-ref-kind-not-captured`），两类证据的断言清单逐字相同时给出
+  `mobile-evidence-refs-duplicated` 警告；未知 kind（如 `network`）不再被静默忽略
+- 修复 `spec-tasks` 元数据漂移不报：`summary.total` / `summary.byLayer` / `perCase` 与 `tasks`
+  对不上时报 `spec-tasks-metadata-mismatch`
+- 修复 `run-mobile-e2e` 的 subprocess 超时异常未捕获（不写 sidecar、看不出发生过什么）：
+  现在记为退出码 124 并照常写 sidecar 与证据
+- 修复证据落盘失败被 `print` 吞掉：写 `.qa-agent/runs/<runId>.evidence-error.json`
+- 修复 `--evidence-locator` 缺失导致 `locator` 恒为 `tree`：按截图兜底时可以正确声明
 
 ## [2.0.0] - 2026-09-16
 

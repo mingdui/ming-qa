@@ -107,3 +107,19 @@ def test_finding_title_prefers_title_then_falls_back():
     assert _finding_title({"summary": "S", "message": "M"}) == "S"
     assert _finding_title({"message": "M"}) == "M"
     assert _finding_title({}) == ""
+
+
+def test_render_hides_category_column_when_findings_have_none():
+    """INFO 类 finding 常没有 category；空列比没列更让人以为缺数据。"""
+    html = _render_code_review(_review("黑盒验收", [
+        {"id": "CR-1", "severity": "INFO", "title": "无源码", "evidence": "APK"},
+    ]))
+    assert ">类型</th>" not in html
+    assert "<td></td>" not in html
+
+
+def test_render_keeps_category_column_when_present():
+    html = _render_code_review(_review("示例", [
+        {"id": "CR-1", "severity": "P1", "title": "问题", "category": "data-consistency"},
+    ]))
+    assert ">类型</th>" in html

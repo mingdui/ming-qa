@@ -35,6 +35,11 @@ description: >
 
 默认最小 task 数：P0=8、P1=5、P2=3、P3=1；默认比例 unit 60% / integration 20% / api 15% / e2e 5%。纯后端 scope（无前端 UI）自动跳过 E2E。
 
+**无源码移动端（被测对象是已安装的 APK/IPA）用 `--profile mobile-e2e`**：只生成 e2e task，
+`platform=android-real`、`targetFile`/`command` 为空、`needsManualCommand=true`——脚本路径由
+实现阶段用 `mobile_adb.py` 填写。此时 `coverage-balance` 也要带 `--profile mobile`
+（e2e 100%、每优先级最少 1 条，且不判 e2e 过重）。
+
 ## 工作流
 
 ### 1. 校验用例
@@ -95,7 +100,7 @@ python "$QA_AGENT_DIR/scripts/qa_agent.py"assert-script-implementation --spec-t
 - `implementationStatus`——implemented 或 not-implemented
 - `executionStatus`——**你这里永远是 not-run**，留给执行阶段来改
 
-根级字段：`generationProfile`（固定为 development，即完整金字塔）、`minSpecsByPriority`、`targetRatio`——`coverage-balance` 会读这些元数据自动匹配配比。
+根级字段：`generationProfile`（`development` 完整金字塔 / `mobile-e2e` 只出 e2e）、`minSpecsByPriority`、`targetRatio`——`coverage-balance` 会读这些元数据自动匹配配比。
 
 ### oracle 结构化契约
 
